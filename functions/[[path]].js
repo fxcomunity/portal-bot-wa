@@ -166,7 +166,7 @@ async function readForm(request) {
 async function cleanupStaleRooms(sql) {
   try {
     await sql`
-      DELETE FROM chess_rooms
+      DELETE FROM chess_online_rooms
       WHERE updated_at < NOW() - INTERVAL '12 hours'
     `
   } catch (error) {
@@ -182,8 +182,8 @@ async function cleanupStaleRooms(sql) {
  * - bot manggil /api/chess/create & /api/chess/join buat bikin room
  * - board HTML yang dikirim ke user manggil /api/chess/:roomCode
  *   buat ambil state & kirim move (polling tiap 1.2 detik)
- * - hasil pertandingan dicatat ke chess_matches, rating pemain
- *   di-update di chess_leaderboard buat ditampilin di /leaderboard
+ * - hasil pertandingan dicatat ke chess_online_matches, rating pemain
+ *   di-update di chess_online_leaderboard buat ditampilin di /leaderboard
  *   & dashboard admin
  * =========================================================
  */
@@ -273,7 +273,7 @@ async function ensureChessTables(sql) {
   if (chessTablesReady) return
 
   await sql`
-    CREATE TABLE IF NOT EXISTS chess_rooms (
+    CREATE TABLE IF NOT EXISTS chess_online_rooms (
       room_code VARCHAR(20) PRIMARY KEY,
       status VARCHAR(20) NOT NULL DEFAULT 'waiting',
       white_player VARCHAR(150),
@@ -297,12 +297,12 @@ async function ensureChessTables(sql) {
   `
 
   await sql`
-    CREATE INDEX IF NOT EXISTS chess_rooms_updated_at_idx
-    ON chess_rooms (updated_at)
+    CREATE INDEX IF NOT EXISTS chess_online_rooms_updated_at_idx
+    ON chess_online_rooms (updated_at)
   `
 
   await sql`
-    CREATE TABLE IF NOT EXISTS chess_matches (
+    CREATE TABLE IF NOT EXISTS chess_online_matches (
       id BIGSERIAL PRIMARY KEY,
       room_code VARCHAR(20) NOT NULL,
       white_player VARCHAR(150),
@@ -315,12 +315,12 @@ async function ensureChessTables(sql) {
   `
 
   await sql`
-    CREATE INDEX IF NOT EXISTS chess_matches_created_at_idx
-    ON chess_matches (created_at)
+    CREATE INDEX IF NOT EXISTS chess_online_matches_created_at_idx
+    ON chess_online_matches (created_at)
   `
 
   await sql`
-    CREATE TABLE IF NOT EXISTS chess_leaderboard (
+    CREATE TABLE IF NOT EXISTS chess_online_leaderboard (
       username VARCHAR(150) PRIMARY KEY,
       rating INT NOT NULL DEFAULT 1000,
       wins INT NOT NULL DEFAULT 0,
@@ -337,7 +337,7 @@ async function ensureChessTables(sql) {
 async function getChessRoom(sql, roomCode) {
   const rows = await sql`
     SELECT *
-    FROM chess_rooms
+    FROM chess_online_rooms
     WHERE room_code = ${roomCode}
     LIMIT 1
   `
@@ -394,7 +394,7 @@ async function createChessRoom(sql, player) {
   const captured = JSON.stringify(chessDefaultCaptured())
 
   const rows = await sql`
-    INSERT INTO chess_rooms (
+    INSERT INTO chess_online_rooms (
       room_code, status, white_player, white_token,
       turn, board, castle, en_passant, halfmove, captured, move_count, version
     )
@@ -447,7 +447,7 @@ async function joinChessRoom(sql, roomCode, player) {
   const token = newChessToken()
 
   const updated = await sql`
-    UPDATE chess_rooms
+    UPDATE chess_online_rooms
     SET black_player = ${player}, black_token = ${token},
         status = 'playing', updated_at = NOW()
     WHERE room_code = ${roomCode} AND black_player IS NULL
@@ -495,7 +495,7 @@ async function recordChessMatch(sql, row, winnerColor, resultLabel) {
         : null
 
   await sql`
-    INSERT INTO chess_matches (
+    INSERT INTO chess_online_matches (
       room_code, white_player, black_player, winner, result, move_count
     )
     VALUES (
@@ -506,24 +506,24 @@ async function recordChessMatch(sql, row, winnerColor, resultLabel) {
 
   if (winnerName) {
     await sql`
-      INSERT INTO chess_leaderboard (username, rating, wins, losses, draws, games, updated_at)
+      INSERT INTO chess_online_leaderboard (username, rating, wins, losses, draws, games, updated_at)
       VALUES (${winnerName}, ${CHESS_RATING_DEFAULT + CHESS_RATING_STEP}, 1, 0, 0, 1, NOW())
       ON CONFLICT (username) DO UPDATE SET
-        rating = chess_leaderboard.rating + ${CHESS_RATING_STEP},
-        wins = chess_leaderboard.wins + 1,
-        games = chess_leaderboard.games + 1,
+        rating = chess_online_leaderboard.rating + ${CHESS_RATING_STEP},
+        wins = chess_online_leaderboard.wins + 1,
+        games = chess_online_leaderboard.games + 1,
         updated_at = NOW()
     `
   }
 
   if (loserName) {
     await sql`
-      INSERT INTO chess_leaderboard (username, rating, wins, losses, draws, games, updated_at)
+      INSERT INTO chess_online_leaderboard (username, rating, wins, losses, draws, games, updated_at)
       VALUES (${loserName}, ${Math.max(0, CHESS_RATING_DEFAULT - CHESS_RATING_STEP)}, 0, 1, 0, 1, NOW())
       ON CONFLICT (username) DO UPDATE SET
-        rating = GREATEST(0, chess_leaderboard.rating - ${CHESS_RATING_STEP}),
-        losses = chess_leaderboard.losses + 1,
-        games = chess_leaderboard.games + 1,
+        rating = GREATEST(0, chess_online_leaderboard.rating - ${CHESS_RATING_STEP}),
+        losses = chess_online_leaderboard.losses + 1,
+        games = chess_online_leaderboard.games + 1,
         updated_at = NOW()
     `
   }
@@ -531,11 +531,11 @@ async function recordChessMatch(sql, row, winnerColor, resultLabel) {
   if (!winnerName && !loserName) {
     for (const name of [row.white_player, row.black_player].filter(Boolean)) {
       await sql`
-        INSERT INTO chess_leaderboard (username, rating, wins, losses, draws, games, updated_at)
+        INSERT INTO chess_online_leaderboard (username, rating, wins, losses, draws, games, updated_at)
         VALUES (${name}, ${CHESS_RATING_DEFAULT}, 0, 0, 1, 1, NOW())
         ON CONFLICT (username) DO UPDATE SET
-          draws = chess_leaderboard.draws + 1,
-          games = chess_leaderboard.games + 1,
+          draws = chess_online_leaderboard.draws + 1,
+          games = chess_online_leaderboard.games + 1,
           updated_at = NOW()
       `
     }
@@ -564,7 +564,7 @@ async function syncChessRoom(sql, roomCode, body) {
     const nextVersion = Number(row.version) + 1
 
     const updated = await sql`
-      UPDATE chess_rooms
+      UPDATE chess_online_rooms
       SET status = 'finished', winner = ${winnerColor}, result = 'resign',
           version = ${nextVersion}, updated_at = NOW(), finished_at = NOW()
       WHERE room_code = ${roomCode} AND version = ${row.version}
@@ -620,7 +620,7 @@ async function syncChessRoom(sql, roomCode, body) {
   const captured = JSON.stringify(body.captured ?? row.captured)
 
   const updated = await sql`
-    UPDATE chess_rooms
+    UPDATE chess_online_rooms
     SET
       turn = ${nextTurn},
       board = ${board}::jsonb,
@@ -884,7 +884,7 @@ async function getDashboardData(sql) {
   try {
     const result = await sql`
       SELECT *
-      FROM chess_leaderboard
+      FROM chess_online_leaderboard
       ORDER BY rating DESC
       LIMIT 10
     `
@@ -894,7 +894,7 @@ async function getDashboardData(sql) {
   try {
     const result = await sql`
       SELECT *
-      FROM chess_matches
+      FROM chess_online_matches
       ORDER BY created_at DESC
       LIMIT 20
     `
@@ -1302,7 +1302,7 @@ async function handleAdmin(request,sql,url) {
   if (search) {
     rooms = await sql`
       SELECT room_code,white_player,black_player,status,updated_at
-      FROM chess_rooms
+      FROM chess_online_rooms
       WHERE room_code ILIKE ${pattern}
          OR COALESCE(white_player,'') ILIKE ${pattern}
          OR COALESCE(black_player,'') ILIKE ${pattern}
@@ -1312,7 +1312,7 @@ async function handleAdmin(request,sql,url) {
   } else {
     rooms = await sql`
       SELECT room_code,white_player,black_player,status,updated_at
-      FROM chess_rooms
+      FROM chess_online_rooms
       ORDER BY updated_at DESC
       LIMIT 100
     `
@@ -1345,7 +1345,7 @@ async function handleAdminDelete(request,sql) {
 
   if (roomCode) {
     await sql`
-      DELETE FROM chess_rooms
+      DELETE FROM chess_online_rooms
       WHERE room_code = ${roomCode}
     `
   }
@@ -1451,9 +1451,9 @@ async function handleHealth(sql) {
 async function handleStatus(sql) {
   try {
     const [rooms, players, matches] = await Promise.all([
-      sql`SELECT COUNT(*)::int AS n FROM chess_rooms WHERE status IN ('waiting','playing')`,
-      sql`SELECT COUNT(*)::int AS n FROM chess_leaderboard`,
-      sql`SELECT COUNT(*)::int AS n FROM chess_matches`
+      sql`SELECT COUNT(*)::int AS n FROM chess_online_rooms WHERE status IN ('waiting','playing')`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_online_leaderboard`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_online_matches`
     ])
 
     return json({
@@ -1471,9 +1471,9 @@ async function handleStatus(sql) {
 async function getPortalStats(sql) {
   try {
     const [rooms, players, matches] = await Promise.all([
-      sql`SELECT COUNT(*)::int AS n FROM chess_rooms WHERE status IN ('waiting','playing')`,
-      sql`SELECT COUNT(*)::int AS n FROM chess_leaderboard`,
-      sql`SELECT COUNT(*)::int AS n FROM chess_matches`
+      sql`SELECT COUNT(*)::int AS n FROM chess_online_rooms WHERE status IN ('waiting','playing')`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_online_leaderboard`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_online_matches`
     ])
 
     return {
@@ -1493,7 +1493,7 @@ async function getActiveChessRooms(sql, search) {
 
     return sql`
       SELECT room_code,status,white_player,black_player,turn,updated_at
-      FROM chess_rooms
+      FROM chess_online_rooms
       WHERE status IN ('waiting','playing')
         AND room_code ILIKE ${pattern}
       ORDER BY updated_at DESC
@@ -1503,7 +1503,7 @@ async function getActiveChessRooms(sql, search) {
 
   return sql`
     SELECT room_code,status,white_player,black_player,turn,updated_at
-    FROM chess_rooms
+    FROM chess_online_rooms
     WHERE status IN ('waiting','playing')
     ORDER BY updated_at DESC
     LIMIT 50
@@ -1513,7 +1513,7 @@ async function getActiveChessRooms(sql, search) {
 async function getChessLeaderboardRows(sql) {
   return sql`
     SELECT username,rating,wins,losses,draws,games
-    FROM chess_leaderboard
+    FROM chess_online_leaderboard
     ORDER BY rating DESC, games DESC
     LIMIT 100
   `
@@ -1655,10 +1655,14 @@ td code{background:#191926;padding:3px 8px;border-radius:7px;font-size:12.5px;le
 .badge.playing{background:#13291d;color:#7ee6a3}
 .badge.waiting{background:#332612;color:#ffcf7a}
 .badge.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-.rank{font-weight:800;width:26px;display:inline-block;text-align:center}
+.rank{font-weight:800;width:26px;height:26px;line-height:26px;border-radius:50%;display:inline-block;text-align:center;font-size:12.5px;background:#181820}
 .rank.gold{color:#ffd166}
 .rank.silver{color:#d9d9e3}
 .rank.bronze{color:#e0a06b}
+.turn{display:inline-flex;align-items:center;gap:7px;font-size:13px;color:#c6cbdb}
+.turn-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;display:inline-block}
+.turn-dot.w{background:#f4f2f8;box-shadow:0 0 0 1px #3a3a48 inset}
+.turn-dot.b{background:#15151d;box-shadow:0 0 0 1px #3a3a48 inset}
 .you-lead{color:#fff;font-weight:700}
 .win{color:#7ee6a3}
 .loss{color:#ff8f9c}
@@ -1714,7 +1718,7 @@ async function handleHome(sql) {
 ${publicTopNav('home')}
 
 <section class="hero">
-<h1>♟️ JACK Portal</h1>
+<h1>JACK Portal</h1>
 <p>Gateway online buat Qiro Ai Chess — main tetap di WhatsApp,<br>di sini cuma buat pantau room &amp; leaderboard.</p>
 </section>
 
@@ -1725,8 +1729,8 @@ ${publicTopNav('home')}
 </div>
 
 <div class="menu">
-<a class="card" href="/rooms">🎮 Room Aktif<span class="arrow">→</span></a>
-<a class="card alt" href="/leaderboard">🏆 Leaderboard<span class="arrow">→</span></a>
+<a class="card" href="/rooms">Room Aktif<span class="arrow">→</span></a>
+<a class="card alt" href="/leaderboard">Leaderboard<span class="arrow">→</span></a>
 </div>
 
 <div class="note">Mau main? Chat bot-nya di WhatsApp, ketik <b>.chess online</b> atau <b>.catur online</b>.</div>
@@ -1750,7 +1754,7 @@ async function handleRoomsPage(sql, url) {
 <td>${badge}</td>
 <td>${escapeHtml(r.white_player || '-')}</td>
 <td>${escapeHtml(r.black_player || 'menunggu...')}</td>
-<td>${r.turn === 'w' ? '⚪ White' : '⚫ Black'}</td>
+<td>${r.turn === 'w' ? '<span class="turn"><i class="turn-dot w"></i>White</span>' : '<span class="turn"><i class="turn-dot b"></i>Black</span>'}</td>
 <td>${timeAgo(r.updated_at)}</td>
 </tr>`
       }).join('')
@@ -1772,7 +1776,7 @@ ${publicTopNav('rooms')}
 <section class="panel">
 <div class="panel-head">
 <div>
-<h2>🎮 Room Aktif</h2>
+<h2>Room Aktif</h2>
 <div class="sub">Auto-refresh tiap 10 detik</div>
 </div>
 <form class="search-form" method="GET" action="/rooms">
@@ -1801,7 +1805,7 @@ async function handleLeaderboardPage(sql) {
     ? rows.map((r, i) => {
         const rank = i + 1
         const rankClass = rank === 1 ? 'gold' : rank === 2 ? 'silver' : rank === 3 ? 'bronze' : ''
-        const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`
+        const medal = String(rank)
 
         return `<tr>
 <td><span class="rank ${rankClass}">${medal}</span></td>
@@ -1830,7 +1834,7 @@ ${publicTopNav('leaderboard')}
 <section class="panel">
 <div class="panel-head">
 <div>
-<h2>🏆 Chess Leaderboard</h2>
+<h2>Chess Leaderboard</h2>
 <div class="sub">Diurutin berdasarkan rating</div>
 </div>
 </div>
@@ -1864,7 +1868,7 @@ async function router(request,env) {
     })
   }
 
-  // Pastiin tabel chess_rooms/chess_matches/chess_leaderboard selalu ada
+  // Pastiin tabel chess_online_rooms/chess_online_matches/chess_online_leaderboard selalu ada
   // sebelum route manapun (termasuk admin dashboard) query ke sana.
   // Cegah "relation does not exist" pas fresh deploy / belum ada game sama sekali.
   // Dibungkus try/catch: kalau proses bikin tabel ini gagal (misal kolom bentrok
