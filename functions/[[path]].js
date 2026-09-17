@@ -1,1283 +1,1496 @@
-/**
- * Jack Portal — Cloudflare Pages Function
- */
-
 import { neon } from '@neondatabase/serverless'
 
-const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const ADMIN_COOKIE = 'portal_admin'
+const SESSION_TTL_SECONDS = 60 * 60 * 8
+const MAX_BODY_SIZE = 256 * 1024
 
-function corsHeaders(extra = {}) {
-  return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    ...extra
+function getSql(env) {
+  if (!env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is not configured')
   }
+
+  return neon(env.DATABASE_URL)
 }
 
-function json(status, data) {
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: corsHeaders({
+    headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store'
-    })
+      'Cache-Control': 'no-store',
+      ...securityHeaders(),
+      ...extraHeaders
+    }
   })
 }
 
-function html(status, body) {
-  return new Response(body, {
+function html(content, status = 200, extraHeaders = {}) {
+  return new Response(content, {
     status,
-    headers: corsHeaders({
+    headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'X-Content-Type-Options': 'nosniff',
-      'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'strict-origin-when-cross-origin',
-      'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'"
-    })
+      'Cache-Control': 'no-store',
+      ...securityHeaders(),
+      ...extraHeaders
+    }
   })
 }
 
-function cleanPlayer(value) {
-  return String(value || '')
-    .trim()
-    .replace(/[<>"'`]/g, '')
-    .slice(0, 100)
+function redirect(url, status = 302) {
+  return new Response(null, {
+    status,
+    headers: {
+      Location: url,
+      ...securityHeaders()
+    }
+  })
 }
 
-function cleanRoom(value) {
-  return String(value || '')
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-    .slice(0, 20)
-}
-
-function newToken() {
-  const bytes = crypto.getRandomValues(new Uint8Array(20))
-  return Array.from(
-    bytes,
-    b => b.toString(16).padStart(2, '0')
-  ).join('')
-}
-
-function makeRoomCode() {
-  const bytes = crypto.getRandomValues(new Uint8Array(8))
-  let out = ''
-
-  for (let i = 0; i < 8; i++) {
-    out += ROOM_CODE_CHARS[
-      bytes[i] % ROOM_CODE_CHARS.length
-    ]
-  }
-
-  return out
-}
-
-function initialBoard() {
-  const back = ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r']
-  const b = Array.from(
-    { length: 8 },
-    () => Array(8).fill(null)
-  )
-
-  for (let c = 0; c < 8; c++) {
-    b[0][c] = { color: 'b', type: back[c] }
-    b[1][c] = { color: 'b', type: 'p' }
-    b[6][c] = { color: 'w', type: 'p' }
-    b[7][c] = { color: 'w', type: back[c] }
-  }
-
-  return b
-}
-
-function initialState() {
+function securityHeaders() {
   return {
-    board: initialBoard(),
-    castle: {
-      w: { k: true, q: true },
-      b: { k: true, q: true }
-    },
-    enPassant: null,
-    halfmove: 0,
-    captured: {
-      w: [],
-      b: []
-    },
-    moveCount: 0
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy':
+      "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
+    'Strict-Transport-Security':
+      'max-age=31536000; includeSubDomains'
   }
-}
-
-function colorFromToken(row, token) {
-  if (!token) return null
-
-  if (
-    row.white_token &&
-    token === row.white_token
-  ) {
-    return 'w'
-  }
-
-  if (
-    row.black_token &&
-    token === row.black_token
-  ) {
-    return 'b'
-  }
-
-  return null
 }
 
 function escapeHtml(value) {
   return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;')
 }
 
-function toGamePayload(row) {
-  const state = row.state || {}
+function cleanText(value, max = 200) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, max)
+}
 
-  return {
-    ok: true,
-    id: row.room_code,
-    roomCode: row.room_code,
-    board: state.board,
-    turn: row.turn,
-    castle: state.castle,
-    enPassant: state.enPassant ?? null,
-    halfmove: state.halfmove ?? 0,
-    captured: state.captured,
-    moveCount: state.moveCount ?? 0,
-    status: row.status,
-    winner: row.winner,
-    version: Number(row.version)
+function cleanUsername(value) {
+  return cleanText(value, 64)
+}
+
+function cleanSearch(value) {
+  return cleanText(value, 100)
+}
+
+function getClientIp(request) {
+  return (
+    request.headers.get('CF-Connecting-IP') ||
+    request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
+    'unknown'
+  )
+}
+
+function parseCookies(request) {
+  const cookieHeader = request.headers.get('Cookie') || ''
+  const cookies = {}
+
+  for (const item of cookieHeader.split(';')) {
+    const index = item.indexOf('=')
+
+    if (index === -1) continue
+
+    const key = item.slice(0, index).trim()
+    const value = item.slice(index + 1).trim()
+
+    cookies[key] = decodeURIComponent(value)
+  }
+
+  return cookies
+}
+
+async function sha256(value) {
+  const data = new TextEncoder().encode(value)
+
+  const hash = await crypto.subtle.digest('SHA-256', data)
+
+  return Array.from(new Uint8Array(hash))
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function randomToken(bytes = 32) {
+  const buffer = new Uint8Array(bytes)
+  crypto.getRandomValues(buffer)
+
+  return Array.from(buffer)
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function normalizePath(url) {
+  let pathname = new URL(url).pathname
+
+  if (pathname.length > 1) {
+    pathname = pathname.replace(/\/+$/, '')
+  }
+
+  return pathname
+}
+
+async function readRequestBody(request) {
+  const contentLength = Number(request.headers.get('Content-Length') || 0)
+
+  if (contentLength > MAX_BODY_SIZE) {
+    throw new Error('BODY_TOO_LARGE')
+  }
+
+  const text = await request.text()
+
+  if (text.length > MAX_BODY_SIZE) {
+    throw new Error('BODY_TOO_LARGE')
+  }
+
+  return text
+}
+
+async function readJson(request) {
+  const contentType = request.headers.get('Content-Type') || ''
+
+  if (!contentType.toLowerCase().includes('application/json')) {
+    throw new Error('INVALID_CONTENT_TYPE')
+  }
+
+  const text = await readRequestBody(request)
+
+  if (!text) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error('INVALID_JSON')
   }
 }
 
-function timeAgo(iso) {
-  if (!iso) return '-'
+async function readForm(request) {
+  const contentType = request.headers.get('Content-Type') || ''
 
-  const diff = Math.max(
-    0,
-    Date.now() - new Date(iso).getTime()
-  )
+  if (
+    !contentType.toLowerCase().includes(
+      'application/x-www-form-urlencoded'
+    )
+  ) {
+    throw new Error('INVALID_CONTENT_TYPE')
+  }
 
-  const sec = Math.floor(diff / 1000)
+  const text = await readRequestBody(request)
 
-  if (sec < 60) return `${sec}d lalu`
-
-  const min = Math.floor(sec / 60)
-
-  if (min < 60) return `${min}m lalu`
-
-  const hr = Math.floor(min / 60)
-
-  if (hr < 24) return `${hr}j lalu`
-
-  return `${Math.floor(hr / 24)}h lalu`
+  return new URLSearchParams(text)
 }
 
-function renderPortalHome() {
-  return `<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Jack Portal</title>
-<style>
-*{box-sizing:border-box}
-body{
-  margin:0;
-  font-family:system-ui,sans-serif;
-  background:#0f0f14;
-  color:#f2f2f2;
-  display:flex;
-  min-height:100vh;
-  align-items:center;
-  justify-content:center
-}
-.wrap{
-  width:100%;
-  max-width:420px;
-  padding:32px;
-  text-align:center
-}
-h1{
-  font-size:28px;
-  margin:0 0 6px
-}
-p{
-  color:#a0a0ab;
-  margin:0;
-  font-size:14px
-}
-.menu{
-  display:flex;
-  flex-direction:column;
-  gap:12px;
-  margin-top:24px
-}
-a.card{
-  display:block;
-  padding:18px;
-  border-radius:14px;
-  background:linear-gradient(135deg,#ff4fd8,#7c4dff);
-  color:#fff;
-  text-decoration:none;
-  font-weight:600;
-  font-size:16px
-}
-a.card.alt{
-  background:linear-gradient(135deg,#4facfe,#00f2fe)
-}
-.note{
-  margin-top:24px;
-  font-size:12px;
-  color:#6b6b76
-}
-</style>
-</head>
-<body>
-<div class="wrap">
-<h1>Jack Portal</h1>
-<p>Gateway info game WhatsApp Bot — main tetap di WA.</p>
+async function cleanupStaleRooms(sql) {
+  try {
+    const result = await sql`
+      DELETE FROM chess_rooms
+      WHERE updated_at < NOW() - INTERVAL '12 hours'
+      RETURNING room_code
+    `
 
-<div class="menu">
-<a class="card alt" href="/rooms">Room Aktif</a>
-<a class="card" href="/leaderboard">Leaderboard</a>
-</div>
-
-<div class="note">
-Mau main? Chat bot-nya, ketik <b>.chess online</b> di WhatsApp.
-</div>
-</div>
-</body>
-</html>`
+    return result.length
+  } catch (error) {
+    console.error('[CLEANUP_ERROR]', error)
+    return 0
+  }
 }
 
-function renderRoomsPage(rows) {
-  const items = rows.map(r => {
-    const statusBadge =
-      r.status === 'playing'
-        ? `<span class="badge playing">Main</span>`
-        : `<span class="badge waiting">Nunggu</span>`
-
-    return `<tr>
-<td><code>${escapeHtml(r.room_code)}</code></td>
-<td>${statusBadge}</td>
-<td>${escapeHtml(r.white_player || '-')}</td>
-<td>${escapeHtml(r.black_player || 'menunggu...')}</td>
-<td>${r.turn === 'w' ? 'White' : 'Black'}</td>
-<td>${timeAgo(r.updated_at)}</td>
-</tr>`
-  }).join('')
-
-  return `<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Room Aktif - Jack Portal</title>
-<meta http-equiv="refresh" content="10">
-<style>
-*{box-sizing:border-box}
-body{
-  margin:0;
-  font-family:system-ui,sans-serif;
-  background:#0f0f14;
-  color:#f2f2f2;
-  padding:24px
-}
-h1{
-  font-size:22px;
-  margin-bottom:4px;
-  text-align:center
-}
-.sub{
-  text-align:center;
-  color:#a0a0ab;
-  font-size:12px;
-  margin-bottom:16px
-}
-table{
-  width:100%;
-  border-collapse:collapse;
-  max-width:640px;
-  margin:0 auto;
-  font-size:14px
-}
-th,td{
-  padding:10px 6px;
-  text-align:left;
-  border-bottom:1px solid #262631
-}
-th{
-  color:#a0a0ab;
-  font-size:11px;
-  text-transform:uppercase
-}
-code{
-  background:#1c1c26;
-  padding:3px 6px;
-  border-radius:6px;
-  font-size:13px
-}
-.badge{
-  font-size:12px;
-  padding:3px 8px;
-  border-radius:20px;
-  white-space:nowrap
-}
-.badge.playing{
-  background:#123a24;
-  color:#7CFF9E
-}
-.badge.waiting{
-  background:#3a3312;
-  color:#FFD86B
-}
-.empty{
-  text-align:center;
-  color:#a0a0ab;
-  padding:32px
-}
-.back{
-  display:block;
-  text-align:center;
-  margin-top:20px;
-  color:#7c4dff;
-  text-decoration:none
-}
-</style>
-</head>
-<body>
-<h1>Room Aktif</h1>
-<div class="sub">Auto-refresh tiap 10 detik</div>
-
-${
-  rows.length
-    ? `<table>
-<thead>
-<tr>
-<th>Kode</th>
-<th>Status</th>
-<th>White</th>
-<th>Black</th>
-<th>Giliran</th>
-<th>Update</th>
-</tr>
-</thead>
-<tbody>${items}</tbody>
-</table>`
-    : `<div class="empty">Gak ada room yang lagi aktif.</div>`
-}
-
-<a class="back" href="/">Kembali ke Portal</a>
-</body>
-</html>`
-}
-
-function renderLeaderboardPage(rows) {
-  const items = rows.map(r => {
-    const rank = Number(r.position)
-
-    return `<tr>
-<td>#${rank}</td>
-<td>${escapeHtml(r.jid)}</td>
-<td>${r.rating}</td>
-<td>${r.wins}</td>
-<td>${r.losses}</td>
-<td>${r.draws}</td>
-<td>${r.games}</td>
-</tr>`
-  }).join('')
-
-  return `<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Leaderboard - Jack Portal</title>
-<style>
-*{box-sizing:border-box}
-body{
-  margin:0;
-  font-family:system-ui,sans-serif;
-  background:#0f0f14;
-  color:#f2f2f2;
-  padding:24px
-}
-h1{
-  font-size:22px;
-  margin-bottom:16px;
-  text-align:center
-}
-table{
-  width:100%;
-  border-collapse:collapse;
-  max-width:620px;
-  margin:0 auto;
-  font-size:14px
-}
-th,td{
-  padding:10px 6px;
-  text-align:left;
-  border-bottom:1px solid #262631
-}
-th{
-  color:#a0a0ab;
-  font-size:11px;
-  text-transform:uppercase
-}
-.empty{
-  text-align:center;
-  color:#a0a0ab;
-  padding:32px
-}
-.back{
-  display:block;
-  text-align:center;
-  margin-top:20px;
-  color:#7c4dff;
-  text-decoration:none
-}
-</style>
-</head>
-<body>
-<h1>Chess Leaderboard</h1>
-
-${
-  rows.length
-    ? `<table>
-<thead>
-<tr>
-<th>#</th>
-<th>Pemain</th>
-<th>Rating</th>
-<th>W</th>
-<th>L</th>
-<th>D</th>
-<th>Main</th>
-</tr>
-</thead>
-<tbody>${items}</tbody>
-</table>`
-    : `<div class="empty">Belum ada game yang selesai.</div>`
-}
-
-<a class="back" href="/">Kembali ke Portal</a>
-</body>
-</html>`
-}
-
-const RATING_STEP = 20
-
-async function finalizeMatch(
-  sql,
-  row,
-  winnerColor,
-  resultLabel
-) {
-  const winnerJid =
-    winnerColor === 'w'
-      ? row.white_player
-      : winnerColor === 'b'
-        ? row.black_player
-        : null
-
-  const loserJid =
-    winnerColor === 'w'
-      ? row.black_player
-      : winnerColor === 'b'
-        ? row.white_player
-        : null
+async function createAdminSession(sql, adminId, request) {
+  const rawToken = randomToken(32)
+  const tokenHash = await sha256(rawToken)
 
   await sql`
-    INSERT INTO chess_matches
-    (
-      room_code,
-      white_player,
-      black_player,
-      winner,
-      result,
-      move_count,
-      moves,
-      final_state,
-      started_at,
-      finished_at
+    INSERT INTO portal_admin_sessions (
+      admin_id,
+      token_hash,
+      expires_at,
+      ip_address,
+      user_agent
     )
     VALUES (
-      ${row.room_code},
-      ${row.white_player},
-      ${row.black_player},
-      ${winnerJid},
-      ${resultLabel},
-      ${row.state?.moveCount || 0},
-      '[]'::jsonb,
-      ${JSON.stringify(row.state || {})},
-      ${row.created_at},
-      NOW()
+      ${adminId},
+      ${tokenHash},
+      NOW() + INTERVAL '8 hours',
+      ${getClientIp(request)},
+      ${cleanText(request.headers.get('User-Agent'), 500)}
     )
   `
 
-  if (winnerJid) {
-    await sql`
-      UPDATE chess_players
-      SET
-        games = games + 1,
-        wins = wins + 1,
-        rating = rating + ${RATING_STEP},
-        win_streak = win_streak + 1,
-        best_win_streak =
-          GREATEST(
-            best_win_streak,
-            win_streak + 1
-          ),
-        updated_at = NOW()
-      WHERE jid = ${winnerJid}
-    `
+  return rawToken
+}
+
+async function getAdmin(sql, request) {
+  const cookies = parseCookies(request)
+  const rawToken = cookies[ADMIN_COOKIE]
+
+  if (!rawToken || rawToken.length < 20) {
+    return null
   }
 
-  if (loserJid) {
-    await sql`
-      UPDATE chess_players
-      SET
-        games = games + 1,
-        losses = losses + 1,
-        rating =
-          GREATEST(
-            0,
-            rating - ${RATING_STEP}
-          ),
-        win_streak = 0,
-        updated_at = NOW()
-      WHERE jid = ${loserJid}
-    `
+  const tokenHash = await sha256(rawToken)
+
+  const result = await sql`
+    SELECT
+      a.id,
+      a.username,
+      s.id AS session_id
+    FROM portal_admin_sessions s
+    INNER JOIN portal_admins a
+      ON a.id = s.admin_id
+    WHERE s.token_hash = ${tokenHash}
+      AND s.expires_at > NOW()
+      AND a.active = TRUE
+    LIMIT 1
+  `
+
+  if (!result.length) {
+    return null
   }
 
-  if (!winnerJid && !loserJid) {
-    for (
-      const jid of
-      [row.white_player, row.black_player]
-        .filter(Boolean)
-    ) {
-      await sql`
-        UPDATE chess_players
-        SET
-          games = games + 1,
-          draws = draws + 1,
-          win_streak = 0,
-          updated_at = NOW()
-        WHERE jid = ${jid}
-      `
+  return result[0]
+}
+
+async function deleteAdminSession(sql, request) {
+  const cookies = parseCookies(request)
+  const rawToken = cookies[ADMIN_COOKIE]
+
+  if (!rawToken) {
+    return
+  }
+
+  const tokenHash = await sha256(rawToken)
+
+  await sql`
+    DELETE FROM portal_admin_sessions
+    WHERE token_hash = ${tokenHash}
+  `
+}
+
+function loginCookie(token) {
+  return [
+    `${ADMIN_COOKIE}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'Secure',
+    'SameSite=Strict',
+    `Max-Age=${SESSION_TTL_SECONDS}`
+  ].join('; ')
+}
+
+function clearLoginCookie() {
+  return [
+    `${ADMIN_COOKIE}=`,
+    'Path=/',
+    'HttpOnly',
+    'Secure',
+    'SameSite=Strict',
+    'Max-Age=0'
+  ].join('; ')
+}
+
+function adminLoginPage(error = '') {
+  const errorHtml = error
+    ? `
+      <div class="error">
+        ${escapeHtml(error)}
+      </div>
+    `
+    : ''
+
+  return `<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admin Login - JACK Portal</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
     }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      font-family:
+        Inter,
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+      background:
+        radial-gradient(
+          circle at top,
+          #182033 0,
+          #0a0d14 45%,
+          #06080d 100%
+        );
+      color: #f4f7fb;
+    }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .wrapper {
+      width: 100%;
+      max-width: 420px;
+    }
+
+    .logo {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 24px;
+    }
+
+    .logo-mark {
+      width: 72px;
+      height: 72px;
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background:
+        linear-gradient(135deg, #ffffff 0%, #dfe5ef 100%);
+      color: #090c12;
+      font-size: 26px;
+      font-weight: 900;
+      letter-spacing: -2px;
+      box-shadow:
+        0 16px 50px rgba(0, 0, 0, .35);
+    }
+
+    .brand {
+      text-align: center;
+      margin-bottom: 22px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 25px;
+      letter-spacing: -.7px;
+    }
+
+    .brand p {
+      margin: 7px 0 0;
+      color: #8f99ab;
+      font-size: 14px;
+    }
+
+    .card {
+      background: rgba(14, 18, 27, .92);
+      border: 1px solid #222a38;
+      border-radius: 20px;
+      padding: 26px;
+      box-shadow:
+        0 24px 80px rgba(0, 0, 0, .45);
+      backdrop-filter: blur(14px);
+    }
+
+    label {
+      display: block;
+      margin: 0 0 8px;
+      color: #c5ccd8;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid #2a3342;
+      outline: none;
+      border-radius: 12px;
+      background: #090d14;
+      color: #fff;
+      padding: 13px 14px;
+      font-size: 15px;
+      transition: .15s ease;
+    }
+
+    input:focus {
+      border-color: #66748a;
+      box-shadow: 0 0 0 3px rgba(148, 163, 184, .08);
+    }
+
+    .field {
+      margin-bottom: 17px;
+    }
+
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 13px 15px;
+      background: #fff;
+      color: #090c12;
+      font-weight: 800;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #e9edf3;
+    }
+
+    .error {
+      border: 1px solid #5c2c35;
+      background: #251318;
+      color: #ffb8c1;
+      border-radius: 11px;
+      padding: 11px 12px;
+      margin-bottom: 17px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .footer {
+      text-align: center;
+      margin-top: 18px;
+      color: #667085;
+      font-size: 12px;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="wrapper">
+
+    <div class="logo">
+      <div class="logo-mark">JP</div>
+    </div>
+
+    <div class="brand">
+      <h1>JACK Portal</h1>
+      <p>Administrator access</p>
+    </div>
+
+    <section class="card">
+      ${errorHtml}
+
+      <form method="POST" action="/admin/login" autocomplete="off">
+
+        <div class="field">
+          <label for="username">Username</label>
+          <input
+            id="username"
+            name="username"
+            type="text"
+            maxlength="64"
+            autocomplete="username"
+            required
+            autofocus
+          >
+        </div>
+
+        <div class="field">
+          <label for="password">Password</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            maxlength="128"
+            autocomplete="current-password"
+            required
+          >
+        </div>
+
+        <button type="submit">
+          Sign in
+        </button>
+
+      </form>
+    </section>
+
+    <div class="footer">
+      JACK Portal Administration
+    </div>
+
+  </main>
+</body>
+</html>`
+}
+
+function adminDashboard(admin, rooms, search, deleted = false) {
+  const rows = rooms.length
+    ? rooms.map(room => `
+      <tr>
+        <td>
+          <strong>${escapeHtml(room.room_code)}</strong>
+        </td>
+
+        <td>
+          ${escapeHtml(room.white_player || '-')}
+        </td>
+
+        <td>
+          ${escapeHtml(room.black_player || '-')}
+        </td>
+
+        <td>
+          ${escapeHtml(room.status || '-')}
+        </td>
+
+        <td>
+          ${escapeHtml(
+            room.updated_at
+              ? new Date(room.updated_at).toLocaleString('id-ID')
+              : '-'
+          )}
+        </td>
+
+        <td>
+          <form
+            method="POST"
+            action="/admin/rooms/delete"
+            onsubmit="return confirm('Hapus room ini?')"
+          >
+            <input
+              type="hidden"
+              name="room_code"
+              value="${escapeHtml(room.room_code)}"
+            >
+
+            <button class="delete" type="submit">
+              Hapus
+            </button>
+          </form>
+        </td>
+      </tr>
+    `).join('')
+    : `
+      <tr>
+        <td colspan="6" class="empty">
+          Tidak ada room ditemukan.
+        </td>
+      </tr>
+    `
+
+  const deletedHtml = deleted
+    ? `
+      <div class="success">
+        Room berhasil dihapus.
+      </div>
+    `
+    : ''
+
+  return `<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+
+  <title>Admin Dashboard - JACK Portal</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      font-family:
+        Inter,
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+      background: #070a10;
+      color: #f4f7fb;
+    }
+
+    body {
+      padding: 24px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 1250px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+    }
+
+    .logo {
+      width: 46px;
+      height: 46px;
+      border-radius: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #fff;
+      color: #090c12;
+      font-size: 16px;
+      font-weight: 900;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: -.5px;
+    }
+
+    .sub {
+      margin-top: 3px;
+      color: #7e8797;
+      font-size: 13px;
+    }
+
+    .logout {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
+      color: #c8ced8;
+      border: 1px solid #28303d;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 13px;
+    }
+
+    .logout:hover {
+      background: #111620;
+    }
+
+    .card {
+      background: #0d1119;
+      border: 1px solid #202836;
+      border-radius: 16px;
+      overflow: hidden;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      padding: 17px;
+      border-bottom: 1px solid #202836;
+    }
+
+    .search {
+      flex: 1;
+      min-width: 0;
+      border: 1px solid #293241;
+      background: #080c13;
+      color: #fff;
+      border-radius: 10px;
+      outline: none;
+      padding: 11px 13px;
+      font-size: 14px;
+    }
+
+    .search:focus {
+      border-color: #66748a;
+    }
+
+    .search-btn {
+      border: 0;
+      border-radius: 10px;
+      padding: 0 18px;
+      background: #fff;
+      color: #080c13;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 14px 16px;
+      border-bottom: 1px solid #1b222e;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    th {
+      color: #7f8999;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+
+    td {
+      color: #cbd2dd;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    strong {
+      color: #fff;
+    }
+
+    .delete {
+      border: 1px solid #59313a;
+      background: #211318;
+      color: #ffb8c1;
+      border-radius: 8px;
+      padding: 8px 11px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .delete:hover {
+      background: #2d171d;
+    }
+
+    .empty {
+      text-align: center;
+      padding: 35px;
+      color: #687386;
+    }
+
+    .success {
+      margin-bottom: 16px;
+      padding: 11px 13px;
+      border: 1px solid #294634;
+      background: #101b14;
+      color: #a9dfb7;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+
+    .info {
+      margin-top: 14px;
+      color: #667085;
+      font-size: 12px;
+    }
+
+    @media (max-width: 800px) {
+      body {
+        padding: 14px;
+      }
+
+      header {
+        align-items: flex-start;
+      }
+
+      .toolbar {
+        flex-direction: column;
+      }
+
+      .search-btn {
+        padding: 11px;
+      }
+
+      .card {
+        overflow-x: auto;
+      }
+
+      table {
+        min-width: 850px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <main class="container">
+
+    <header>
+      <div class="brand">
+        <div class="logo">JP</div>
+
+        <div>
+          <h1>JACK Portal</h1>
+          <div class="sub">
+            Logged in as ${escapeHtml(admin.username)}
+          </div>
+        </div>
+      </div>
+
+      <a class="logout" href="/admin/logout">
+        Logout
+      </a>
+    </header>
+
+    ${deletedHtml}
+
+    <section class="card">
+
+      <form
+        class="toolbar"
+        method="GET"
+        action="/admin"
+      >
+        <input
+          class="search"
+          type="search"
+          name="search"
+          value="${escapeHtml(search)}"
+          placeholder="Cari room code..."
+          maxlength="100"
+        >
+
+        <button
+          class="search-btn"
+          type="submit"
+        >
+          Cari
+        </button>
+      </form>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Room</th>
+            <th>White</th>
+            <th>Black</th>
+            <th>Status</th>
+            <th>Updated</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+
+    </section>
+
+    <div class="info">
+      Room yang tidak diperbarui selama lebih dari 12 jam akan dibersihkan otomatis.
+    </div>
+
+  </main>
+
+</body>
+</html>`
+}
+
+async function handleAdminLogin(request, sql) {
+  if (request.method === 'GET') {
+    return html(adminLoginPage())
+  }
+
+  if (request.method !== 'POST') {
+    return json(
+      {
+        ok: false,
+        error: 'METHOD_NOT_ALLOWED'
+      },
+      405
+    )
+  }
+
+  const form = await readForm(request)
+
+  const username = cleanUsername(form.get('username'))
+  const password = String(form.get('password') || '')
+
+  if (!username || !password) {
+    return html(
+      adminLoginPage('Username dan password wajib diisi.'),
+      400
+    )
+  }
+
+  if (password.length > 128) {
+    return html(
+      adminLoginPage('Password tidak valid.'),
+      400
+    )
+  }
+
+  const ip = getClientIp(request)
+
+  try {
+    const attempts = await sql`
+      SELECT
+        attempts,
+        blocked_until
+      FROM portal_login_attempts
+      WHERE ip = ${ip}
+      LIMIT 1
+    `
+
+    if (
+      attempts.length &&
+      attempts[0].blocked_until &&
+      new Date(attempts[0].blocked_until) > new Date()
+    ) {
+      return html(
+        adminLoginPage(
+          'Terlalu banyak percobaan login. Coba lagi nanti.'
+        ),
+        429
+      )
+    }
+
+    const admins = await sql`
+      SELECT
+        id,
+        username
+      FROM portal_admins
+      WHERE username = ${username}
+        AND active = TRUE
+        AND password_hash = crypt(
+          ${password},
+          password_hash
+        )
+      LIMIT 1
+    `
+
+    if (!admins.length) {
+      await sql`
+        INSERT INTO portal_login_attempts (
+          ip,
+          window_started_at,
+          attempts,
+          blocked_until
+        )
+        VALUES (
+          ${ip},
+          NOW(),
+          1,
+          NULL
+        )
+        ON CONFLICT (ip)
+        DO UPDATE SET
+          attempts = CASE
+            WHEN portal_login_attempts.window_started_at
+              < NOW() - INTERVAL '15 minutes'
+            THEN 1
+            ELSE portal_login_attempts.attempts + 1
+          END,
+
+          window_started_at = CASE
+            WHEN portal_login_attempts.window_started_at
+              < NOW() - INTERVAL '15 minutes'
+            THEN NOW()
+            ELSE portal_login_attempts.window_started_at
+          END,
+
+          blocked_until = CASE
+            WHEN portal_login_attempts.attempts + 1 >= 8
+            THEN NOW() + INTERVAL '15 minutes'
+            ELSE portal_login_attempts.blocked_until
+          END
+      `
+
+      return html(
+        adminLoginPage('Username atau password salah.'),
+        401
+      )
+    }
+
+    await sql`
+      DELETE FROM portal_login_attempts
+      WHERE ip = ${ip}
+    `
+
+    const token = await createAdminSession(
+      sql,
+      admins[0].id,
+      request
+    )
+
+    return new Response(null, {
+      status: 303,
+      headers: {
+        Location: '/admin',
+        'Set-Cookie': loginCookie(token),
+        ...securityHeaders()
+      }
+    })
+  } catch (error) {
+    console.error('[ADMIN_LOGIN_ERROR]', error)
+
+    return html(
+      adminLoginPage(
+        'Login gagal karena konfigurasi server bermasalah.'
+      ),
+      500
+    )
   }
 }
 
-export async function onRequest(context) {
-  const { request, env } = context
+async function handleAdmin(request, sql, url) {
+  const admin = await getAdmin(sql, request)
 
-  if (request.method === 'OPTIONS') {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders()
-    })
+  if (!admin) {
+    return redirect('/admin/login')
   }
 
-  const connectionString =
-    env.CHESS_DATABASE_URL ||
-    env.DATABASE_URL ||
-    ''
+  const search = cleanSearch(
+    url.searchParams.get('search')
+  )
 
-  if (!connectionString) {
-    return json(500, {
-      ok: false,
-      error: 'DATABASE_URL_NOT_CONFIGURED'
-    })
+  let rooms
+
+  if (search) {
+    const pattern = `%${search}%`
+
+    rooms = await sql`
+      SELECT
+        room_code,
+        white_player,
+        black_player,
+        status,
+        updated_at
+      FROM chess_rooms
+      WHERE room_code ILIKE ${pattern}
+         OR COALESCE(white_player, '') ILIKE ${pattern}
+         OR COALESCE(black_player, '') ILIKE ${pattern}
+      ORDER BY updated_at DESC
+      LIMIT 100
+    `
+  } else {
+    rooms = await sql`
+      SELECT
+        room_code,
+        white_player,
+        black_player,
+        status,
+        updated_at
+      FROM chess_rooms
+      ORDER BY updated_at DESC
+      LIMIT 100
+    `
   }
 
-  const sql = neon(connectionString, {
-    fullResults: true
-  })
-
-  const url = new URL(request.url)
-  const pathname = url.pathname
-
-  try {
-    /*
-     * HEALTH
-     *
-     * Sengaja diletakkan sebelum query lain.
-     * Endpoint ini hanya menguji koneksi Neon.
-     */
-    if (
-      request.method === 'GET' &&
-      pathname === '/health'
-    ) {
-      await sql`SELECT 1`
-
-      return json(200, {
-        ok: true,
-        database: true,
-        service: 'chess'
-      })
-    }
-
-    if (
-      request.method === 'GET' &&
-      pathname === '/'
-    ) {
-      return html(
-        200,
-        renderPortalHome()
-      )
-    }
-
-    if (
-      request.method === 'GET' &&
-      pathname === '/api/status'
-    ) {
-      return json(200, {
-        ok: true,
-        service: 'Jack Portal',
-        database: 'Neon Postgres',
-        status: 'online',
-        time: Date.now()
-      })
-    }
-
-    /*
-     * LEADERBOARD
-     */
-    if (
-      pathname === '/leaderboard' ||
-      pathname === '/api/leaderboard'
-    ) {
-      const { rows } = await sql`
-        SELECT
-          position,
-          jid,
-          rating,
-          games,
-          wins,
-          losses,
-          draws,
-          win_streak,
-          best_win_streak
-        FROM leaderboard_chess
-        ORDER BY position ASC
-        LIMIT 50
-      `
-
-      return pathname === '/leaderboard'
-        ? html(
-            200,
-            renderLeaderboardPage(rows)
-          )
-        : json(200, {
-            ok: true,
-            leaderboard: rows
-          })
-    }
-
-    /*
-     * ROOM AKTIF
-     */
-    if (
-      pathname === '/rooms' ||
-      pathname === '/api/rooms'
-    ) {
-      const { rows } = await sql`
-        SELECT
-          room_code,
-          status,
-          white_player,
-          black_player,
-          turn,
-          updated_at
-        FROM chess_rooms
-        WHERE status IN ('waiting', 'playing')
-        ORDER BY updated_at DESC
-        LIMIT 50
-      `
-
-      return pathname === '/rooms'
-        ? html(
-            200,
-            renderRoomsPage(rows)
-          )
-        : json(200, {
-            ok: true,
-            rooms: rows
-          })
-    }
-
-    /*
-     * CREATE ROOM
-     */
-    if (
-      request.method === 'POST' &&
-      pathname === '/api/chess/create'
-    ) {
-      let body = {}
-
-      try {
-        body = await request.json()
-      } catch {}
-
-      const player = cleanPlayer(
-        body.player ||
-        body.playerId ||
-        body.jid
-      )
-
-      if (!player) {
-        return json(400, {
-          ok: false,
-          error: 'PLAYER_REQUIRED'
-        })
-      }
-
-      await sql`
-        INSERT INTO rpg_users (jid)
-        VALUES (${player})
-        ON CONFLICT (jid) DO NOTHING
-      `
-
-      await sql`
-        INSERT INTO chess_players (jid)
-        VALUES (${player})
-        ON CONFLICT (jid) DO NOTHING
-      `
-
-      let roomCode = null
-
-      for (let i = 0; i < 10; i++) {
-        const candidate = makeRoomCode()
-
-        const { rows: existing } = await sql`
-          SELECT 1
-          FROM chess_rooms
-          WHERE room_code = ${candidate}
-          LIMIT 1
-        `
-
-        if (!existing.length) {
-          roomCode = candidate
-          break
-        }
-      }
-
-      if (!roomCode) {
-        return json(500, {
-          ok: false,
-          error: 'ROOM_CODE_GEN_FAILED'
-        })
-      }
-
-      const token = newToken()
-      const state = JSON.stringify(
-        initialState()
-      )
-
-      const { rows } = await sql`
-        INSERT INTO chess_rooms
-        (
-          room_code,
-          status,
-          white_player,
-          white_token,
-          turn,
-          state,
-          version
-        )
-        VALUES (
-          ${roomCode},
-          'waiting',
-          ${player},
-          ${token},
-          'w',
-          ${state}::jsonb,
-          0
-        )
-        RETURNING *
-      `
-
-      const row = rows[0]
-
-      return json(200, {
-        ...toGamePayload(row),
-        token,
-        color: 'w',
-        room_code: row.room_code
-      })
-    }
-
-    /*
-     * JOIN ROOM
-     */
-    if (
-      request.method === 'POST' &&
-      pathname === '/api/chess/join'
-    ) {
-      let body = {}
-
-      try {
-        body = await request.json()
-      } catch {}
-
-      const roomCode = cleanRoom(
-        body.room ||
-        body.roomCode ||
-        body.code
-      )
-
-      const player = cleanPlayer(
-        body.player ||
-        body.playerId ||
-        body.jid
-      )
-
-      if (!roomCode || !player) {
-        return json(400, {
-          ok: false,
-          error: 'ROOM_AND_PLAYER_REQUIRED'
-        })
-      }
-
-      const { rows: found } = await sql`
-        SELECT *
-        FROM chess_rooms
-        WHERE room_code = ${roomCode}
-        LIMIT 1
-      `
-
-      const row = found[0]
-
-      if (!row) {
-        return json(404, {
-          ok: false,
-          error: 'ROOM_NOT_FOUND'
-        })
-      }
-
-      if (row.white_player === player) {
-        return json(200, {
-          ...toGamePayload(row),
-          token: row.white_token,
-          color: 'w',
-          room_code: row.room_code
-        })
-      }
-
-      if (row.black_player === player) {
-        return json(200, {
-          ...toGamePayload(row),
-          token: row.black_token,
-          color: 'b',
-          room_code: row.room_code
-        })
-      }
-
-      if (row.black_player) {
-        return json(409, {
-          ok: false,
-          error: 'ROOM_FULL'
-        })
-      }
-
-      await sql`
-        INSERT INTO rpg_users (jid)
-        VALUES (${player})
-        ON CONFLICT (jid) DO NOTHING
-      `
-
-      await sql`
-        INSERT INTO chess_players (jid)
-        VALUES (${player})
-        ON CONFLICT (jid) DO NOTHING
-      `
-
-      const token = newToken()
-
-      const { rows: updated } = await sql`
-        UPDATE chess_rooms
-        SET
-          black_player = ${player},
-          black_token = ${token},
-          status = 'playing',
-          updated_at = NOW()
-        WHERE
-          room_code = ${roomCode}
-          AND black_player IS NULL
-        RETURNING *
-      `
-
-      if (!updated.length) {
-        const { rows: fresh } = await sql`
-          SELECT *
-          FROM chess_rooms
-          WHERE room_code = ${roomCode}
-          LIMIT 1
-        `
-
-        if (
-          fresh[0]?.black_player === player
-        ) {
-          return json(200, {
-            ...toGamePayload(fresh[0]),
-            token: fresh[0].black_token,
-            color: 'b',
-            room_code: fresh[0].room_code
-          })
-        }
-
-        return json(409, {
-          ok: false,
-          error: 'ROOM_FULL'
-        })
-      }
-
-      const fresh = updated[0]
-
-      return json(200, {
-        ...toGamePayload(fresh),
-        token,
-        color: 'b',
-        room_code: fresh.room_code
-      })
-    }
-
-    /*
-     * CHESS STATE / MOVE / RESIGN
-     */
-    if (
-      pathname.startsWith('/api/chess/')
-    ) {
-      const roomCode = cleanRoom(
-        decodeURIComponent(
-          pathname.slice(
-            '/api/chess/'.length
-          )
-        )
-      )
-
-      if (!roomCode) {
-        return json(400, {
-          ok: false,
-          error: 'INVALID_ROOM_CODE'
-        })
-      }
-
-      /*
-       * GET STATE
-       */
-      if (request.method === 'GET') {
-        const token =
-          url.searchParams.get('token') || ''
-
-        const { rows } = await sql`
-          SELECT *
-          FROM chess_rooms
-          WHERE room_code = ${roomCode}
-          LIMIT 1
-        `
-
-        const row = rows[0]
-
-        if (!row) {
-          return json(404, {
-            ok: false,
-            error: 'ROOM_NOT_FOUND'
-          })
-        }
-
-        if (!colorFromToken(row, token)) {
-          return json(403, {
-            ok: false,
-            error: 'INVALID_TOKEN'
-          })
-        }
-
-        return json(
-          200,
-          toGamePayload(row)
-        )
-      }
-
-      /*
-       * POST MOVE / RESIGN
-       */
-      if (request.method === 'POST') {
-        let body = {}
-
-        try {
-          body = await request.json()
-        } catch {}
-
-        const { rows } = await sql`
-          SELECT *
-          FROM chess_rooms
-          WHERE room_code = ${roomCode}
-          LIMIT 1
-        `
-
-        const row = rows[0]
-
-        if (!row) {
-          return json(404, {
-            ok: false,
-            error: 'ROOM_NOT_FOUND'
-          })
-        }
-
-        const playerColor =
-          colorFromToken(
-            row,
-            body.token
-          )
-
-        if (!playerColor) {
-          return json(403, {
-            ok: false,
-            error: 'INVALID_TOKEN'
-          })
-        }
-
-        /*
-         * RESIGN
-         */
-        if (body.resign === true) {
-          if (row.status === 'finished') {
-            return json(
-              200,
-              toGamePayload(row)
-            )
-          }
-
-          const winnerColor =
-            playerColor === 'w'
-              ? 'b'
-              : 'w'
-
-          const nextVersion =
-            Number(row.version) + 1
-
-          const { rows: updated } = await sql`
-            UPDATE chess_rooms
-            SET
-              status = 'finished',
-              winner = ${winnerColor},
-              result = 'resign',
-              version = ${nextVersion},
-              updated_at = NOW(),
-              finished_at = NOW()
-            WHERE
-              room_code = ${roomCode}
-              AND version = ${row.version}
-            RETURNING *
-          `
-
-          if (!updated.length) {
-            return json(409, {
-              ok: false,
-              error: 'STALE_VERSION'
-            })
-          }
-
-          await finalizeMatch(
-            sql,
-            updated[0],
-            winnerColor,
-            'resign'
-          ).catch(error => {
-            console.error(
-              '[FINALIZE MATCH ERROR]',
-              error
-            )
-          })
-
-          return json(
-            200,
-            toGamePayload(updated[0])
-          )
-        }
-
-        /*
-         * MOVE VALIDATION
-         */
-        if (row.status === 'finished') {
-          return json(409, {
-            ok: false,
-            error: 'GAME_FINISHED'
-          })
-        }
-
-        if (row.status !== 'playing') {
-          return json(409, {
-            ok: false,
-            error: 'WAITING_FOR_PLAYER'
-          })
-        }
-
-        if (row.turn !== playerColor) {
-          return json(409, {
-            ok: false,
-            error: 'NOT_YOUR_TURN'
-          })
-        }
-
-        const clientVersion =
-          Number(body.version)
-
-        if (
-          Number.isFinite(clientVersion) &&
-          clientVersion !== Number(row.version)
-        ) {
-          return json(409, {
-            ok: false,
-            error: 'STALE_VERSION'
-          })
-        }
-
-        const nextTurn =
-          playerColor === 'w'
-            ? 'b'
-            : 'w'
-
-        const nextVersion =
-          Number(row.version) + 1
-
-        const finished =
-          body.status === 'finished'
-
-        const winner =
-          finished &&
-          (
-            body.winner === 'w' ||
-            body.winner === 'b'
-          )
-            ? body.winner
-            : null
-
-        const newState =
-          JSON.stringify({
-            board:
-              body.board ??
-              row.state?.board,
-
-            castle:
-              body.castle ??
-              row.state?.castle,
-
-            enPassant:
-              body.enPassant != null
-                ? body.enPassant
-                : null,
-
-            halfmove:
-              Number(
-                body.halfmove || 0
-              ),
-
-            captured:
-              body.captured ??
-              row.state?.captured,
-
-            moveCount:
-              Number(
-                body.moveCount || 0
-              )
-          })
-
-        const nextStatus =
-          finished
-            ? 'finished'
-            : 'playing'
-
-        const nextResult =
-          finished
-            ? (
-                winner
-                  ? 'checkmate'
-                  : 'draw'
-              )
-            : null
-
-        const { rows: updated } = await sql`
-          UPDATE chess_rooms
-          SET
-            turn = ${nextTurn},
-            state = ${newState}::jsonb,
-            status = ${nextStatus},
-            winner = ${winner},
-            result = ${nextResult},
-            version = ${nextVersion},
-            updated_at = NOW(),
-            finished_at =
-              CASE
-                WHEN ${nextStatus} = 'finished'
-                  THEN NOW()
-                ELSE finished_at
-              END
-          WHERE
-            room_code = ${roomCode}
-            AND version = ${row.version}
-          RETURNING *
-        `
-
-        if (!updated.length) {
-          return json(409, {
-            ok: false,
-            error: 'STALE_VERSION'
-          })
-        }
-
-        if (finished) {
-          await finalizeMatch(
-            sql,
-            updated[0],
-            winner,
-            winner
-              ? 'checkmate'
-              : 'draw'
-          ).catch(error => {
-            console.error(
-              '[FINALIZE MATCH ERROR]',
-              error
-            )
-          })
-        }
-
-        return json(
-          200,
-          toGamePayload(updated[0])
-        )
-      }
-
-      return json(405, {
+  const deleted =
+    url.searchParams.get('deleted') === '1'
+
+  return html(
+    adminDashboard(
+      admin,
+      rooms,
+      search,
+      deleted
+    )
+  )
+}
+
+async function handleAdminDelete(request, sql) {
+  const admin = await getAdmin(sql, request)
+
+  if (!admin) {
+    return redirect('/admin/login')
+  }
+
+  if (request.method !== 'POST') {
+    return json(
+      {
         ok: false,
         error: 'METHOD_NOT_ALLOWED'
-      })
+      },
+      405
+    )
+  }
+
+  const form = await readForm(request)
+
+  const roomCode = cleanText(
+    form.get('room_code'),
+    64
+  )
+
+  if (!roomCode) {
+    return redirect('/admin')
+  }
+
+  await sql`
+    DELETE FROM chess_rooms
+    WHERE room_code = ${roomCode}
+  `
+
+  return redirect('/admin?deleted=1')
+}
+
+async function handleAdminLogout(request, sql) {
+  try {
+    await deleteAdminSession(sql, request)
+  } catch (error) {
+    console.error('[LOGOUT_ERROR]', error)
+  }
+
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: '/admin/login',
+      'Set-Cookie': clearLoginCookie(),
+      ...securityHeaders()
+    }
+  })
+}
+
+async function handleHealth(sql) {
+  try {
+    await sql`SELECT 1 AS ok`
+
+    return json({
+      ok: true,
+      service: 'jack-portal',
+      database: 'connected'
+    })
+  } catch (error) {
+    console.error('[HEALTH_ERROR]', error)
+
+    return json(
+      {
+        ok: false,
+        service: 'jack-portal',
+        database: 'error'
+      },
+      503
+    )
+  }
+}
+
+async function handleStatus(sql) {
+  try {
+    const result = await sql`
+      SELECT
+        COUNT(*)::int AS total_rooms
+      FROM chess_rooms
+    `
+
+    return json({
+      ok: true,
+      total_rooms: result[0]?.total_rooms || 0
+    })
+  } catch (error) {
+    console.error('[STATUS_ERROR]', error)
+
+    return json(
+      {
+        ok: false,
+        error: 'INTERNAL_SERVER_ERROR'
+      },
+      500
+    )
+  }
+}
+
+async function handleRooms(sql, url) {
+  const search = cleanSearch(
+    url.searchParams.get('search')
+  )
+
+  if (search) {
+    const pattern = `%${search}%`
+
+    const rooms = await sql`
+      SELECT
+        room_code,
+        status,
+        updated_at
+      FROM chess_rooms
+      WHERE room_code ILIKE ${pattern}
+      ORDER BY updated_at DESC
+      LIMIT 50
+    `
+
+    return json({
+      ok: true,
+      rooms
+    })
+  }
+
+  const rooms = await sql`
+    SELECT
+      room_code,
+      status,
+      updated_at
+    FROM chess_rooms
+    ORDER BY updated_at DESC
+    LIMIT 50
+  `
+
+  return json({
+    ok: true,
+    rooms
+  })
+}
+
+async function handleLeaderboard(sql) {
+  try {
+    const result = await sql`
+      SELECT *
+      FROM chess_leaderboard
+      ORDER BY rating DESC
+      LIMIT 100
+    `
+
+    return json({
+      ok: true,
+      leaderboard: result
+    })
+  } catch {
+    return json({
+      ok: true,
+      leaderboard: []
+    })
+  }
+}
+
+function homePage() {
+  return `<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+
+  <title>JACK Portal</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
     }
 
-    return json(404, {
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: #070a10;
+      color: #fff;
+      font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+    }
+
+    .box {
+      text-align: center;
+      max-width: 520px;
+    }
+
+    .logo {
+      width: 80px;
+      height: 80px;
+      border-radius: 22px;
+      margin: 0 auto 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #fff;
+      color: #080b10;
+      font-weight: 900;
+      font-size: 27px;
+      letter-spacing: -2px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 30px;
+    }
+
+    p {
+      color: #858fa0;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="box">
+    <div class="logo">JP</div>
+
+    <h1>JACK Portal</h1>
+
+    <p>
+      Portal service is running normally.
+    </p>
+  </main>
+</body>
+</html>`
+}
+
+async function router(request, env) {
+  const url = new URL(request.url)
+  const pathname = normalizePath(request.url)
+  const method = request.method.toUpperCase()
+
+  const sql = getSql(env)
+
+  /*
+   * HEALTH CHECK
+   *
+   * Sengaja dijalankan sebelum cleanup.
+   * Jadi kalau cleanup/schema chess bermasalah,
+   * /health tetap bisa memberi diagnosis database.
+   */
+  if (pathname === '/health') {
+    return handleHealth(sql)
+  }
+
+  /*
+   * ADMIN ROUTER
+   */
+  if (pathname === '/admin/login') {
+    return handleAdminLogin(request, sql)
+  }
+
+  if (pathname === '/admin/logout') {
+    return handleAdminLogout(request, sql)
+  }
+
+  if (pathname === '/admin') {
+    if (method !== 'GET') {
+      return json(
+        {
+          ok: false,
+          error: 'METHOD_NOT_ALLOWED'
+        },
+        405
+      )
+    }
+
+    return handleAdmin(request, sql, url)
+  }
+
+  if (pathname === '/admin/rooms/delete') {
+    return handleAdminDelete(request, sql)
+  }
+
+  /*
+   * CLEANUP
+   *
+   * Error cleanup tidak boleh membuat API utama
+   * menjadi INTERNAL_SERVER_ERROR.
+   */
+  await cleanupStaleRooms(sql)
+
+  /*
+   * PUBLIC ROUTER
+   */
+  if (pathname === '/') {
+    return html(homePage())
+  }
+
+  if (pathname === '/api/status') {
+    return handleStatus(sql)
+  }
+
+  if (pathname === '/rooms') {
+    return handleRooms(sql, url)
+  }
+
+  if (pathname === '/leaderboard') {
+    return handleLeaderboard(sql)
+  }
+
+  /*
+   * CHESS ROUTER
+   *
+   * Route chess utama tetap bisa dipasang di bawah sini.
+   * Bagian ini sengaja tidak mengarang struktur payload
+   * project lama yang belum terlihat di file terbaru.
+   */
+
+  if (
+    pathname === '/api/chess/create' ||
+    pathname === '/api/chess/join' ||
+    pathname.startsWith('/api/chess/')
+  ) {
+    return json(
+      {
+        ok: false,
+        error: 'CHESS_ROUTE_NOT_CONFIGURED'
+      },
+      501
+    )
+  }
+
+  return json(
+    {
       ok: false,
       error: 'NOT_FOUND'
-    })
+    },
+    404
+  )
+}
 
-  } catch (error) {
-    console.error(
-      '[CHESS PORTAL ERROR]',
-      error
+export async function onRequest(context) {
+  try {
+    return await router(
+      context.request,
+      context.env
     )
+  } catch (error) {
+    console.error('[PORTAL_ERROR]', error)
 
-    return json(500, {
-      ok: false,
-      error: 'INTERNAL_SERVER_ERROR'
-    })
+    if (error?.message === 'BODY_TOO_LARGE') {
+      return json(
+        {
+          ok: false,
+          error: 'BODY_TOO_LARGE'
+        },
+        413
+      )
+    }
+
+    if (error?.message === 'INVALID_JSON') {
+      return json(
+        {
+          ok: false,
+          error: 'INVALID_JSON'
+        },
+        400
+      )
+    }
+
+    if (error?.message === 'INVALID_CONTENT_TYPE') {
+      return json(
+        {
+          ok: false,
+          error: 'INVALID_CONTENT_TYPE'
+        },
+        415
+      )
+    }
+
+    return json(
+      {
+        ok: false,
+        error: 'INTERNAL_SERVER_ERROR'
+      },
+      500
+    )
   }
 }
