@@ -5,11 +5,21 @@ const SESSION_TTL_SECONDS = 60 * 60 * 8
 const MAX_BODY_SIZE = 256 * 1024
 
 function getSql(env) {
-  if (!env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is not configured')
-  }
-
+  if (!env.DATABASE_URL) throw new Error('DATABASE_URL is not configured')
   return neon(env.DATABASE_URL)
+}
+
+function securityHeaders() {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy':
+      "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
+    'Strict-Transport-Security':
+      'max-age=31536000; includeSubDomains'
+  }
 }
 
 function json(data, status = 200, extraHeaders = {}) {
@@ -46,19 +56,6 @@ function redirect(url, status = 302) {
   })
 }
 
-function securityHeaders() {
-  return {
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy':
-      "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
-    'Strict-Transport-Security':
-      'max-age=31536000; includeSubDomains'
-  }
-}
-
 function escapeHtml(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -92,18 +89,21 @@ function getClientIp(request) {
 }
 
 function parseCookies(request) {
-  const cookieHeader = request.headers.get('Cookie') || ''
   const cookies = {}
+  const header = request.headers.get('Cookie') || ''
 
-  for (const item of cookieHeader.split(';')) {
+  for (const item of header.split(';')) {
     const index = item.indexOf('=')
-
     if (index === -1) continue
 
     const key = item.slice(0, index).trim()
     const value = item.slice(index + 1).trim()
 
-    cookies[key] = decodeURIComponent(value)
+    try {
+      cookies[key] = decodeURIComponent(value)
+    } catch {
+      cookies[key] = value
+    }
   }
 
   return cookies
@@ -111,7 +111,6 @@ function parseCookies(request) {
 
 async function sha256(value) {
   const data = new TextEncoder().encode(value)
-
   const hash = await crypto.subtle.digest('SHA-256', data)
 
   return Array.from(new Uint8Array(hash))
@@ -154,54 +153,24 @@ async function readRequestBody(request) {
   return text
 }
 
-async function readJson(request) {
-  const contentType = request.headers.get('Content-Type') || ''
-
-  if (!contentType.toLowerCase().includes('application/json')) {
-    throw new Error('INVALID_CONTENT_TYPE')
-  }
-
-  const text = await readRequestBody(request)
-
-  if (!text) {
-    return {}
-  }
-
-  try {
-    return JSON.parse(text)
-  } catch {
-    throw new Error('INVALID_JSON')
-  }
-}
-
 async function readForm(request) {
-  const contentType = request.headers.get('Content-Type') || ''
+  const type = request.headers.get('Content-Type') || ''
 
-  if (
-    !contentType.toLowerCase().includes(
-      'application/x-www-form-urlencoded'
-    )
-  ) {
+  if (!type.toLowerCase().includes('application/x-www-form-urlencoded')) {
     throw new Error('INVALID_CONTENT_TYPE')
   }
 
-  const text = await readRequestBody(request)
-
-  return new URLSearchParams(text)
+  return new URLSearchParams(await readRequestBody(request))
 }
 
 async function cleanupStaleRooms(sql) {
   try {
-    const result = await sql`
+    await sql`
       DELETE FROM chess_rooms
       WHERE updated_at < NOW() - INTERVAL '12 hours'
-      RETURNING room_code
     `
-
-    return result.length
   } catch (error) {
     console.error('[CLEANUP_ERROR]', error)
-    return 0
   }
 }
 
@@ -230,12 +199,9 @@ async function createAdminSession(sql, adminId, request) {
 }
 
 async function getAdmin(sql, request) {
-  const cookies = parseCookies(request)
-  const rawToken = cookies[ADMIN_COOKIE]
+  const rawToken = parseCookies(request)[ADMIN_COOKIE]
 
-  if (!rawToken || rawToken.length < 20) {
-    return null
-  }
+  if (!rawToken || rawToken.length < 20) return null
 
   const tokenHash = await sha256(rawToken)
 
@@ -245,34 +211,23 @@ async function getAdmin(sql, request) {
       a.username,
       s.id AS session_id
     FROM portal_admin_sessions s
-    INNER JOIN portal_admins a
-      ON a.id = s.admin_id
+    JOIN portal_admins a ON a.id = s.admin_id
     WHERE s.token_hash = ${tokenHash}
       AND s.expires_at > NOW()
       AND a.active = TRUE
     LIMIT 1
   `
 
-  if (!result.length) {
-    return null
-  }
-
-  return result[0]
+  return result[0] || null
 }
 
 async function deleteAdminSession(sql, request) {
-  const cookies = parseCookies(request)
-  const rawToken = cookies[ADMIN_COOKIE]
-
-  if (!rawToken) {
-    return
-  }
-
-  const tokenHash = await sha256(rawToken)
+  const rawToken = parseCookies(request)[ADMIN_COOKIE]
+  if (!rawToken) return
 
   await sql`
     DELETE FROM portal_admin_sessions
-    WHERE token_hash = ${tokenHash}
+    WHERE token_hash = ${await sha256(rawToken)}
   `
 }
 
@@ -299,644 +254,419 @@ function clearLoginCookie() {
 }
 
 function adminLoginPage(error = '') {
-  const errorHtml = error
-    ? `
-      <div class="error">
-        ${escapeHtml(error)}
-      </div>
-    `
-    : ''
-
   return `<!doctype html>
 <html lang="id">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Admin Login - JACK Portal</title>
-
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      margin: 0;
-      min-height: 100%;
-      font-family:
-        Inter,
-        ui-sans-serif,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-      background:
-        radial-gradient(
-          circle at top,
-          #182033 0,
-          #0a0d14 45%,
-          #06080d 100%
-        );
-      color: #f4f7fb;
-    }
-
-    body {
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-    }
-
-    .wrapper {
-      width: 100%;
-      max-width: 420px;
-    }
-
-    .logo {
-      display: flex;
-      justify-content: center;
-      margin-bottom: 24px;
-    }
-
-    .logo-mark {
-      width: 72px;
-      height: 72px;
-      border-radius: 20px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background:
-        linear-gradient(135deg, #ffffff 0%, #dfe5ef 100%);
-      color: #090c12;
-      font-size: 26px;
-      font-weight: 900;
-      letter-spacing: -2px;
-      box-shadow:
-        0 16px 50px rgba(0, 0, 0, .35);
-    }
-
-    .brand {
-      text-align: center;
-      margin-bottom: 22px;
-    }
-
-    .brand h1 {
-      margin: 0;
-      font-size: 25px;
-      letter-spacing: -.7px;
-    }
-
-    .brand p {
-      margin: 7px 0 0;
-      color: #8f99ab;
-      font-size: 14px;
-    }
-
-    .card {
-      background: rgba(14, 18, 27, .92);
-      border: 1px solid #222a38;
-      border-radius: 20px;
-      padding: 26px;
-      box-shadow:
-        0 24px 80px rgba(0, 0, 0, .45);
-      backdrop-filter: blur(14px);
-    }
-
-    label {
-      display: block;
-      margin: 0 0 8px;
-      color: #c5ccd8;
-      font-size: 13px;
-      font-weight: 600;
-    }
-
-    input {
-      width: 100%;
-      border: 1px solid #2a3342;
-      outline: none;
-      border-radius: 12px;
-      background: #090d14;
-      color: #fff;
-      padding: 13px 14px;
-      font-size: 15px;
-      transition: .15s ease;
-    }
-
-    input:focus {
-      border-color: #66748a;
-      box-shadow: 0 0 0 3px rgba(148, 163, 184, .08);
-    }
-
-    .field {
-      margin-bottom: 17px;
-    }
-
-    button {
-      width: 100%;
-      border: 0;
-      border-radius: 12px;
-      padding: 13px 15px;
-      background: #fff;
-      color: #090c12;
-      font-weight: 800;
-      font-size: 14px;
-      cursor: pointer;
-    }
-
-    button:hover {
-      background: #e9edf3;
-    }
-
-    .error {
-      border: 1px solid #5c2c35;
-      background: #251318;
-      color: #ffb8c1;
-      border-radius: 11px;
-      padding: 11px 12px;
-      margin-bottom: 17px;
-      font-size: 13px;
-      line-height: 1.45;
-    }
-
-    .footer {
-      text-align: center;
-      margin-top: 18px;
-      color: #667085;
-      font-size: 12px;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Login - JACK Portal</title>
+<style>
+*{box-sizing:border-box}
+body{
+ margin:0;min-height:100vh;display:flex;align-items:center;
+ justify-content:center;padding:20px;background:#070a10;color:#fff;
+ font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
+}
+.box{width:100%;max-width:400px}
+.logo{
+ width:72px;height:72px;border-radius:20px;background:#fff;color:#080b10;
+ display:flex;align-items:center;justify-content:center;margin:0 auto 20px;
+ font-weight:900;font-size:24px
+}
+.brand{text-align:center;margin-bottom:22px}
+.brand h1{margin:0;font-size:25px}
+.brand p{margin:7px 0 0;color:#7f8999;font-size:13px}
+.card{
+ background:#0d1119;border:1px solid #202836;border-radius:18px;
+ padding:24px
+}
+.field{margin-bottom:16px}
+label{display:block;margin-bottom:7px;color:#aeb7c5;font-size:13px}
+input{
+ width:100%;padding:13px;border-radius:10px;border:1px solid #293241;
+ background:#080c13;color:#fff;outline:0;font-size:14px
+}
+input:focus{border-color:#66748a}
+button{
+ width:100%;padding:13px;border:0;border-radius:10px;background:#fff;
+ color:#080b10;font-weight:800;cursor:pointer
+}
+.error{
+ padding:11px;border-radius:10px;margin-bottom:16px;
+ background:#251318;border:1px solid #5c2c35;color:#ffb8c1;font-size:13px
+}
+</style>
 </head>
-
 <body>
-  <main class="wrapper">
-
-    <div class="logo">
-      <div class="logo-mark">JP</div>
-    </div>
-
-    <div class="brand">
-      <h1>JACK Portal</h1>
-      <p>Administrator access</p>
-    </div>
-
-    <section class="card">
-      ${errorHtml}
-
-      <form method="POST" action="/admin/login" autocomplete="off">
-
-        <div class="field">
-          <label for="username">Username</label>
-          <input
-            id="username"
-            name="username"
-            type="text"
-            maxlength="64"
-            autocomplete="username"
-            required
-            autofocus
-          >
-        </div>
-
-        <div class="field">
-          <label for="password">Password</label>
-          <input
-            id="password"
-            name="password"
-            type="password"
-            maxlength="128"
-            autocomplete="current-password"
-            required
-          >
-        </div>
-
-        <button type="submit">
-          Sign in
-        </button>
-
-      </form>
-    </section>
-
-    <div class="footer">
-      JACK Portal Administration
-    </div>
-
-  </main>
+<main class="box">
+<div class="logo">JP</div>
+<div class="brand">
+<h1>JACK Portal</h1>
+<p>Administrator access</p>
+</div>
+<section class="card">
+${error ? `<div class="error">${escapeHtml(error)}</div>` : ''}
+<form method="POST" action="/admin/login" autocomplete="off">
+<div class="field">
+<label>Username</label>
+<input name="username" maxlength="64" autocomplete="username" required autofocus>
+</div>
+<div class="field">
+<label>Password</label>
+<input name="password" type="password" maxlength="128" autocomplete="current-password" required>
+</div>
+<button type="submit">Sign in</button>
+</form>
+</section>
+</main>
 </body>
 </html>`
 }
 
-function adminDashboard(admin, rooms, search, deleted = false) {
-  const rows = rooms.length
+async function getDashboardData(sql) {
+  let leaderboard = []
+  let matches = []
+
+  try {
+    const result = await sql`
+      SELECT *
+      FROM chess_leaderboard
+      ORDER BY rating DESC
+      LIMIT 10
+    `
+    leaderboard = result
+  } catch {}
+
+  try {
+    const result = await sql`
+      SELECT *
+      FROM chess_matches
+      ORDER BY created_at DESC
+      LIMIT 20
+    `
+    matches = result
+  } catch {}
+
+  return { leaderboard, matches }
+}
+
+function adminDashboard(admin, rooms, search, data, deleted = false) {
+  const activePlayers = new Set()
+
+  for (const room of rooms) {
+    if (room.white_player) activePlayers.add(room.white_player)
+    if (room.black_player) activePlayers.add(room.black_player)
+  }
+
+  const roomRows = rooms.length
     ? rooms.map(room => `
-      <tr>
-        <td>
-          <strong>${escapeHtml(room.room_code)}</strong>
-        </td>
+<tr>
+<td><strong>${escapeHtml(room.room_code)}</strong></td>
+<td>${escapeHtml(room.white_player || '-')}</td>
+<td>${escapeHtml(room.black_player || '-')}</td>
+<td>${escapeHtml(room.status || '-')}</td>
+<td>${escapeHtml(room.updated_at ? new Date(room.updated_at).toLocaleString('id-ID') : '-')}</td>
+<td>
+<form method="POST" action="/admin/rooms/delete">
+<input type="hidden" name="room_code" value="${escapeHtml(room.room_code)}">
+<button class="danger" type="submit">Hapus</button>
+</form>
+</td>
+</tr>
+`).join('')
+    : `<tr><td colspan="6" class="empty">Tidak ada room ditemukan.</td></tr>`
 
-        <td>
-          ${escapeHtml(room.white_player || '-')}
-        </td>
+  const leaderboardRows = data.leaderboard.length
+    ? data.leaderboard.map((player, index) => `
+<tr>
+<td>${index + 1}</td>
+<td>${escapeHtml(player.username || player.player_name || player.name || '-')}</td>
+<td>${escapeHtml(player.rating ?? '-')}</td>
+<td>${escapeHtml(player.wins ?? '-')}</td>
+<td>${escapeHtml(player.losses ?? '-')}</td>
+</tr>
+`).join('')
+    : `<tr><td colspan="5" class="empty">Leaderboard belum tersedia.</td></tr>`
 
-        <td>
-          ${escapeHtml(room.black_player || '-')}
-        </td>
-
-        <td>
-          ${escapeHtml(room.status || '-')}
-        </td>
-
-        <td>
-          ${escapeHtml(
-            room.updated_at
-              ? new Date(room.updated_at).toLocaleString('id-ID')
-              : '-'
-          )}
-        </td>
-
-        <td>
-          <form
-            method="POST"
-            action="/admin/rooms/delete"
-            onsubmit="return confirm('Hapus room ini?')"
-          >
-            <input
-              type="hidden"
-              name="room_code"
-              value="${escapeHtml(room.room_code)}"
-            >
-
-            <button class="delete" type="submit">
-              Hapus
-            </button>
-          </form>
-        </td>
-      </tr>
-    `).join('')
-    : `
-      <tr>
-        <td colspan="6" class="empty">
-          Tidak ada room ditemukan.
-        </td>
-      </tr>
-    `
-
-  const deletedHtml = deleted
-    ? `
-      <div class="success">
-        Room berhasil dihapus.
-      </div>
-    `
-    : ''
+  const matchRows = data.matches.length
+    ? data.matches.map(match => `
+<tr>
+<td>${escapeHtml(match.room_code || '-')}</td>
+<td>${escapeHtml(match.white_player || '-')}</td>
+<td>${escapeHtml(match.black_player || '-')}</td>
+<td>${escapeHtml(match.result || match.status || '-')}</td>
+<td>${escapeHtml(match.created_at ? new Date(match.created_at).toLocaleString('id-ID') : '-')}</td>
+</tr>
+`).join('')
+    : `<tr><td colspan="5" class="empty">Match history belum tersedia.</td></tr>`
 
   return `<!doctype html>
 <html lang="id">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-
-  <title>Admin Dashboard - JACK Portal</title>
-
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      margin: 0;
-      min-height: 100%;
-      font-family:
-        Inter,
-        ui-sans-serif,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-      background: #070a10;
-      color: #f4f7fb;
-    }
-
-    body {
-      padding: 24px;
-    }
-
-    .container {
-      width: 100%;
-      max-width: 1250px;
-      margin: 0 auto;
-    }
-
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
-      margin-bottom: 24px;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 13px;
-    }
-
-    .logo {
-      width: 46px;
-      height: 46px;
-      border-radius: 13px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #fff;
-      color: #090c12;
-      font-size: 16px;
-      font-weight: 900;
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 22px;
-      letter-spacing: -.5px;
-    }
-
-    .sub {
-      margin-top: 3px;
-      color: #7e8797;
-      font-size: 13px;
-    }
-
-    .logout {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      text-decoration: none;
-      color: #c8ced8;
-      border: 1px solid #28303d;
-      border-radius: 10px;
-      padding: 10px 14px;
-      font-size: 13px;
-    }
-
-    .logout:hover {
-      background: #111620;
-    }
-
-    .card {
-      background: #0d1119;
-      border: 1px solid #202836;
-      border-radius: 16px;
-      overflow: hidden;
-    }
-
-    .toolbar {
-      display: flex;
-      gap: 10px;
-      padding: 17px;
-      border-bottom: 1px solid #202836;
-    }
-
-    .search {
-      flex: 1;
-      min-width: 0;
-      border: 1px solid #293241;
-      background: #080c13;
-      color: #fff;
-      border-radius: 10px;
-      outline: none;
-      padding: 11px 13px;
-      font-size: 14px;
-    }
-
-    .search:focus {
-      border-color: #66748a;
-    }
-
-    .search-btn {
-      border: 0;
-      border-radius: 10px;
-      padding: 0 18px;
-      background: #fff;
-      color: #080c13;
-      font-weight: 800;
-      cursor: pointer;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th,
-    td {
-      padding: 14px 16px;
-      border-bottom: 1px solid #1b222e;
-      text-align: left;
-      font-size: 13px;
-    }
-
-    th {
-      color: #7f8999;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: .5px;
-    }
-
-    td {
-      color: #cbd2dd;
-    }
-
-    tr:last-child td {
-      border-bottom: 0;
-    }
-
-    strong {
-      color: #fff;
-    }
-
-    .delete {
-      border: 1px solid #59313a;
-      background: #211318;
-      color: #ffb8c1;
-      border-radius: 8px;
-      padding: 8px 11px;
-      cursor: pointer;
-      font-size: 12px;
-    }
-
-    .delete:hover {
-      background: #2d171d;
-    }
-
-    .empty {
-      text-align: center;
-      padding: 35px;
-      color: #687386;
-    }
-
-    .success {
-      margin-bottom: 16px;
-      padding: 11px 13px;
-      border: 1px solid #294634;
-      background: #101b14;
-      color: #a9dfb7;
-      border-radius: 10px;
-      font-size: 13px;
-    }
-
-    .info {
-      margin-top: 14px;
-      color: #667085;
-      font-size: 12px;
-    }
-
-    @media (max-width: 800px) {
-      body {
-        padding: 14px;
-      }
-
-      header {
-        align-items: flex-start;
-      }
-
-      .toolbar {
-        flex-direction: column;
-      }
-
-      .search-btn {
-        padding: 11px;
-      }
-
-      .card {
-        overflow-x: auto;
-      }
-
-      table {
-        min-width: 850px;
-      }
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Dashboard - JACK Portal</title>
+<style>
+*{box-sizing:border-box}
+body{
+ margin:0;background:#070a10;color:#f4f7fb;
+ font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
+}
+button,input{font:inherit}
+.layout{display:flex;min-height:100vh}
+.sidebar{
+ width:250px;background:#0b0f17;border-right:1px solid #202836;
+ padding:20px;position:fixed;inset:0 auto 0 0;z-index:10;
+ transition:.2s
+}
+.logo{
+ width:44px;height:44px;border-radius:12px;background:#fff;color:#080b10;
+ display:flex;align-items:center;justify-content:center;font-weight:900
+}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:30px}
+.brand strong{font-size:17px}
+.brand small{display:block;color:#697386;margin-top:3px}
+.nav button{
+ width:100%;border:0;background:transparent;color:#8c96a7;
+ text-align:left;padding:12px;border-radius:9px;margin-bottom:5px;cursor:pointer
+}
+.nav button:hover,.nav button.active{background:#151b26;color:#fff}
+.main{margin-left:250px;width:calc(100% - 250px);padding:22px}
+.top{
+ display:flex;align-items:center;justify-content:space-between;
+ gap:12px;margin-bottom:22px
+}
+.top h1{margin:0;font-size:22px}
+.top p{margin:4px 0 0;color:#707a8b;font-size:13px}
+.menu{display:none;border:1px solid #293241;background:#0d1119;color:#fff;border-radius:9px;padding:9px 12px}
+.logout{
+ text-decoration:none;color:#aeb7c5;border:1px solid #293241;
+ padding:9px 12px;border-radius:9px;font-size:13px
+}
+.stats{
+ display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px
+}
+.stat{
+ background:#0d1119;border:1px solid #202836;border-radius:14px;padding:17px
+}
+.stat span{color:#707a8b;font-size:12px}
+.stat strong{display:block;font-size:25px;margin-top:7px}
+.card{
+ background:#0d1119;border:1px solid #202836;border-radius:14px;
+ margin-bottom:16px;overflow:hidden
+}
+.card-head{
+ display:flex;align-items:center;justify-content:space-between;
+ padding:16px;border-bottom:1px solid #202836
+}
+.card-head h2{margin:0;font-size:15px}
+.toolbar{display:flex;gap:9px}
+.search{
+ flex:1;min-width:0;background:#080c13;color:#fff;
+ border:1px solid #293241;border-radius:9px;padding:11px
+}
+.search-btn{
+ border:0;border-radius:9px;padding:0 16px;background:#fff;
+ color:#080b10;font-weight:800;cursor:pointer
+}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse;min-width:700px}
+th,td{padding:13px 15px;border-bottom:1px solid #1b222e;text-align:left;font-size:13px}
+th{color:#707a8b;font-size:11px;text-transform:uppercase}
+td{color:#cbd2dd}
+tr:last-child td{border-bottom:0}
+.danger{
+ border:1px solid #59313a;background:#211318;color:#ffb8c1;
+ border-radius:7px;padding:7px 10px;cursor:pointer
+}
+.empty{text-align:center;color:#697386;padding:30px}
+.success{
+ padding:11px 13px;border:1px solid #294634;background:#101b14;
+ color:#a9dfb7;border-radius:10px;margin-bottom:16px;font-size:13px
+}
+.page{display:none}
+.page.active{display:block}
+@media(max-width:800px){
+ .sidebar{transform:translateX(-100%)}
+ .sidebar.open{transform:translateX(0)}
+ .main{margin-left:0;width:100%;padding:14px}
+ .menu{display:block}
+ .logout{font-size:12px}
+ .stats{grid-template-columns:1fr}
+ .card-head{align-items:stretch;flex-direction:column;gap:10px}
+ .toolbar{width:100%}
+}
+</style>
 </head>
-
 <body>
+<div class="layout">
 
-  <main class="container">
+<aside class="sidebar" id="sidebar">
+<div class="brand">
+<div class="logo">JP</div>
+<div>
+<strong>JACK Portal</strong>
+<small>Administration</small>
+</div>
+</div>
 
-    <header>
-      <div class="brand">
-        <div class="logo">JP</div>
+<nav class="nav">
+<button class="active" data-page="overview">Dashboard</button>
+<button data-page="rooms">Rooms</button>
+<button data-page="leaderboard">Leaderboard</button>
+<button data-page="matches">Match History</button>
+<button data-page="settings">Settings</button>
+</nav>
+</aside>
 
-        <div>
-          <h1>JACK Portal</h1>
-          <div class="sub">
-            Logged in as ${escapeHtml(admin.username)}
-          </div>
-        </div>
-      </div>
+<main class="main">
+<header class="top">
+<div style="display:flex;align-items:center;gap:10px">
+<button class="menu" id="menu">Menu</button>
+<div>
+<h1>Dashboard</h1>
+<p>Logged in as ${escapeHtml(admin.username)}</p>
+</div>
+</div>
+<a class="logout" href="/admin/logout">Logout</a>
+</header>
 
-      <a class="logout" href="/admin/logout">
-        Logout
-      </a>
-    </header>
+${deleted ? `<div class="success">Room berhasil dihapus.</div>` : ''}
 
-    ${deletedHtml}
+<section class="page active" id="page-overview">
+<div class="stats">
+<div class="stat">
+<span>Total Room</span>
+<strong>${rooms.length}</strong>
+</div>
+<div class="stat">
+<span>Pemain Aktif</span>
+<strong>${activePlayers.size}</strong>
+</div>
+<div class="stat">
+<span>Leaderboard</span>
+<strong>${data.leaderboard.length}</strong>
+</div>
+</div>
 
-    <section class="card">
+<div class="card">
+<div class="card-head"><h2>Room Terbaru</h2></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Room</th><th>White</th><th>Black</th><th>Status</th><th>Updated</th><th>Action</th></tr></thead>
+<tbody>${roomRows}</tbody>
+</table>
+</div>
+</div>
+</section>
 
-      <form
-        class="toolbar"
-        method="GET"
-        action="/admin"
-      >
-        <input
-          class="search"
-          type="search"
-          name="search"
-          value="${escapeHtml(search)}"
-          placeholder="Cari room code..."
-          maxlength="100"
-        >
+<section class="page" id="page-rooms">
+<div class="card">
+<div class="card-head">
+<h2>Rooms</h2>
+<form class="toolbar" method="GET" action="/admin">
+<input class="search" name="search" value="${escapeHtml(search)}" placeholder="Cari room / pemain..." maxlength="100">
+<button class="search-btn">Cari</button>
+</form>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Room</th><th>White</th><th>Black</th><th>Status</th><th>Updated</th><th>Action</th></tr></thead>
+<tbody>${roomRows}</tbody>
+</table>
+</div>
+</div>
+</section>
 
-        <button
-          class="search-btn"
-          type="submit"
-        >
-          Cari
-        </button>
-      </form>
+<section class="page" id="page-leaderboard">
+<div class="card">
+<div class="card-head"><h2>Leaderboard</h2></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>#</th><th>Pemain</th><th>Rating</th><th>Wins</th><th>Losses</th></tr></thead>
+<tbody>${leaderboardRows}</tbody>
+</table>
+</div>
+</div>
+</section>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Room</th>
-            <th>White</th>
-            <th>Black</th>
-            <th>Status</th>
-            <th>Updated</th>
-            <th>Action</th>
-          </tr>
-        </thead>
+<section class="page" id="page-matches">
+<div class="card">
+<div class="card-head"><h2>Match History</h2></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Room</th><th>White</th><th>Black</th><th>Result</th><th>Waktu</th></tr></thead>
+<tbody>${matchRows}</tbody>
+</table>
+</div>
+</div>
+</section>
 
-        <tbody>
-          ${rows}
-        </tbody>
-      </table>
+<section class="page" id="page-settings">
+<div class="card">
+<div class="card-head"><h2>Settings Admin</h2></div>
+<form method="POST" action="/admin/settings" style="padding:16px">
+<div style="margin-bottom:14px">
+<label>Username</label>
+<input class="search" style="width:100%;margin-top:7px" name="username" value="${escapeHtml(admin.username)}" maxlength="64" required>
+</div>
+<div style="margin-bottom:14px">
+<label>Password Baru</label>
+<input class="search" style="width:100%;margin-top:7px" name="password" type="password" maxlength="128" placeholder="Kosongkan jika tidak ingin mengubah">
+</div>
+<button class="search-btn" style="padding:11px 16px" type="submit">Simpan Perubahan</button>
+</form>
+</div>
+</section>
 
-    </section>
+</main>
+</div>
 
-    <div class="info">
-      Room yang tidak diperbarui selama lebih dari 12 jam akan dibersihkan otomatis.
-    </div>
+<script>
+const sidebar=document.getElementById('sidebar')
+const menu=document.getElementById('menu')
 
-  </main>
+menu?.addEventListener('click',()=>sidebar.classList.toggle('open'))
 
+document.querySelectorAll('.nav button').forEach(button=>{
+ button.addEventListener('click',()=>{
+  document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'))
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'))
+
+  button.classList.add('active')
+  document.getElementById('page-'+button.dataset.page)?.classList.add('active')
+  sidebar.classList.remove('open')
+ })
+})
+</script>
 </body>
 </html>`
 }
 
 async function handleAdminLogin(request, sql) {
-  if (request.method === 'GET') {
-    return html(adminLoginPage())
-  }
+  if (request.method === 'GET') return html(adminLoginPage())
 
   if (request.method !== 'POST') {
-    return json(
-      {
-        ok: false,
-        error: 'METHOD_NOT_ALLOWED'
-      },
-      405
-    )
+    return json({ok:false,error:'METHOD_NOT_ALLOWED'},405)
   }
 
   const form = await readForm(request)
-
   const username = cleanUsername(form.get('username'))
   const password = String(form.get('password') || '')
 
   if (!username || !password) {
-    return html(
-      adminLoginPage('Username dan password wajib diisi.'),
-      400
-    )
+    return html(adminLoginPage('Username dan password wajib diisi.'),400)
   }
 
   if (password.length > 128) {
-    return html(
-      adminLoginPage('Password tidak valid.'),
-      400
-    )
+    return html(adminLoginPage('Password tidak valid.'),400)
   }
 
   const ip = getClientIp(request)
 
   try {
     const attempts = await sql`
-      SELECT
-        attempts,
-        blocked_until
+      SELECT attempts, blocked_until
       FROM portal_login_attempts
       WHERE ip = ${ip}
       LIMIT 1
@@ -947,58 +677,36 @@ async function handleAdminLogin(request, sql) {
       attempts[0].blocked_until &&
       new Date(attempts[0].blocked_until) > new Date()
     ) {
-      return html(
-        adminLoginPage(
-          'Terlalu banyak percobaan login. Coba lagi nanti.'
-        ),
-        429
-      )
+      return html(adminLoginPage('Terlalu banyak percobaan login. Coba lagi nanti.'),429)
     }
 
     const admins = await sql`
-      SELECT
-        id,
-        username
+      SELECT id, username
       FROM portal_admins
       WHERE username = ${username}
         AND active = TRUE
-        AND password_hash = crypt(
-          ${password},
-          password_hash
-        )
+        AND password_hash = crypt(${password}, password_hash)
       LIMIT 1
     `
 
     if (!admins.length) {
       await sql`
-        INSERT INTO portal_login_attempts (
-          ip,
-          window_started_at,
-          attempts,
-          blocked_until
-        )
-        VALUES (
-          ${ip},
-          NOW(),
-          1,
-          NULL
-        )
+        INSERT INTO portal_login_attempts
+          (ip, window_started_at, attempts, blocked_until)
+        VALUES
+          (${ip}, NOW(), 1, NULL)
         ON CONFLICT (ip)
         DO UPDATE SET
           attempts = CASE
-            WHEN portal_login_attempts.window_started_at
-              < NOW() - INTERVAL '15 minutes'
+            WHEN portal_login_attempts.window_started_at < NOW() - INTERVAL '15 minutes'
             THEN 1
             ELSE portal_login_attempts.attempts + 1
           END,
-
           window_started_at = CASE
-            WHEN portal_login_attempts.window_started_at
-              < NOW() - INTERVAL '15 minutes'
+            WHEN portal_login_attempts.window_started_at < NOW() - INTERVAL '15 minutes'
             THEN NOW()
             ELSE portal_login_attempts.window_started_at
           END,
-
           blocked_until = CASE
             WHEN portal_login_attempts.attempts + 1 >= 8
             THEN NOW() + INTERVAL '15 minutes'
@@ -1006,148 +714,161 @@ async function handleAdminLogin(request, sql) {
           END
       `
 
-      return html(
-        adminLoginPage('Username atau password salah.'),
-        401
-      )
+      return html(adminLoginPage('Username atau password salah.'),401)
     }
 
-    await sql`
-      DELETE FROM portal_login_attempts
-      WHERE ip = ${ip}
-    `
+    await sql`DELETE FROM portal_login_attempts WHERE ip = ${ip}`
 
-    const token = await createAdminSession(
-      sql,
-      admins[0].id,
-      request
-    )
+    const token = await createAdminSession(sql,admins[0].id,request)
 
-    return new Response(null, {
-      status: 303,
-      headers: {
-        Location: '/admin',
-        'Set-Cookie': loginCookie(token),
+    return new Response(null,{
+      status:303,
+      headers:{
+        Location:'/admin',
+        'Set-Cookie':loginCookie(token),
         ...securityHeaders()
       }
     })
-  } catch (error) {
-    console.error('[ADMIN_LOGIN_ERROR]', error)
-
-    return html(
-      adminLoginPage(
-        'Login gagal karena konfigurasi server bermasalah.'
-      ),
-      500
-    )
+  } catch(error) {
+    console.error('[ADMIN_LOGIN_ERROR]',error)
+    return html(adminLoginPage('Login gagal karena konfigurasi server bermasalah.'),500)
   }
 }
 
-async function handleAdmin(request, sql, url) {
-  const admin = await getAdmin(sql, request)
+async function handleAdmin(request,sql,url) {
+  const admin = await getAdmin(sql,request)
 
-  if (!admin) {
-    return redirect('/admin/login')
-  }
+  if (!admin) return redirect('/admin/login')
 
-  const search = cleanSearch(
-    url.searchParams.get('search')
-  )
+  const search = cleanSearch(url.searchParams.get('search'))
+  const pattern = `%${search}%`
 
-  let rooms
+  let rooms = []
 
   if (search) {
-    const pattern = `%${search}%`
-
     rooms = await sql`
-      SELECT
-        room_code,
-        white_player,
-        black_player,
-        status,
-        updated_at
+      SELECT room_code,white_player,black_player,status,updated_at
       FROM chess_rooms
       WHERE room_code ILIKE ${pattern}
-         OR COALESCE(white_player, '') ILIKE ${pattern}
-         OR COALESCE(black_player, '') ILIKE ${pattern}
+         OR COALESCE(white_player,'') ILIKE ${pattern}
+         OR COALESCE(black_player,'') ILIKE ${pattern}
       ORDER BY updated_at DESC
       LIMIT 100
     `
   } else {
     rooms = await sql`
-      SELECT
-        room_code,
-        white_player,
-        black_player,
-        status,
-        updated_at
+      SELECT room_code,white_player,black_player,status,updated_at
       FROM chess_rooms
       ORDER BY updated_at DESC
       LIMIT 100
     `
   }
 
-  const deleted =
-    url.searchParams.get('deleted') === '1'
+  const data = await getDashboardData(sql)
 
   return html(
     adminDashboard(
       admin,
       rooms,
       search,
-      deleted
+      data,
+      url.searchParams.get('deleted') === '1'
     )
   )
 }
 
-async function handleAdminDelete(request, sql) {
-  const admin = await getAdmin(sql, request)
+async function handleAdminDelete(request,sql) {
+  const admin = await getAdmin(sql,request)
 
-  if (!admin) {
-    return redirect('/admin/login')
-  }
+  if (!admin) return redirect('/admin/login')
 
   if (request.method !== 'POST') {
-    return json(
-      {
-        ok: false,
-        error: 'METHOD_NOT_ALLOWED'
-      },
-      405
-    )
+    return json({ok:false,error:'METHOD_NOT_ALLOWED'},405)
   }
 
   const form = await readForm(request)
+  const roomCode = cleanText(form.get('room_code'),64)
 
-  const roomCode = cleanText(
-    form.get('room_code'),
-    64
-  )
-
-  if (!roomCode) {
-    return redirect('/admin')
+  if (roomCode) {
+    await sql`
+      DELETE FROM chess_rooms
+      WHERE room_code = ${roomCode}
+    `
   }
-
-  await sql`
-    DELETE FROM chess_rooms
-    WHERE room_code = ${roomCode}
-  `
 
   return redirect('/admin?deleted=1')
 }
 
-async function handleAdminLogout(request, sql) {
-  try {
-    await deleteAdminSession(sql, request)
-  } catch (error) {
-    console.error('[LOGOUT_ERROR]', error)
+async function handleAdminSettings(request,sql) {
+  const admin = await getAdmin(sql,request)
+
+  if (!admin) return redirect('/admin/login')
+
+  if (request.method !== 'POST') {
+    return json({ok:false,error:'METHOD_NOT_ALLOWED'},405)
   }
 
-  return new Response(null, {
-    status: 303,
-    headers: {
-      Location: '/admin/login',
-      'Set-Cookie': clearLoginCookie(),
+  const form = await readForm(request)
+  const username = cleanUsername(form.get('username'))
+  const password = String(form.get('password') || '')
+
+  if (!username) {
+    return json({ok:false,error:'INVALID_USERNAME'},400)
+  }
+
+  if (password && password.length < 8) {
+    return json({ok:false,error:'PASSWORD_TOO_SHORT'},400)
+  }
+
+  if (password.length > 128) {
+    return json({ok:false,error:'PASSWORD_TOO_LONG'},400)
+  }
+
+  try {
+    if (password) {
+      await sql`
+        UPDATE portal_admins
+        SET
+          username = ${username},
+          password_hash = crypt(${password},gen_salt('bf',12)),
+          updated_at = NOW()
+        WHERE id = ${admin.id}
+      `
+    } else {
+      await sql`
+        UPDATE portal_admins
+        SET
+          username = ${username},
+          updated_at = NOW()
+        WHERE id = ${admin.id}
+      `
+    }
+
+    await sql`
+      DELETE FROM portal_admin_sessions
+      WHERE admin_id = ${admin.id}
+        AND id <> ${admin.session_id}
+    `
+
+    return redirect('/admin')
+  } catch(error) {
+    console.error('[ADMIN_SETTINGS_ERROR]',error)
+    return json({ok:false,error:'SETTINGS_UPDATE_FAILED'},500)
+  }
+}
+
+async function handleAdminLogout(request,sql) {
+  try {
+    await deleteAdminSession(sql,request)
+  } catch(error) {
+    console.error('[LOGOUT_ERROR]',error)
+  }
+
+  return new Response(null,{
+    status:303,
+    headers:{
+      Location:'/admin/login',
+      'Set-Cookie':clearLoginCookie(),
       ...securityHeaders()
     }
   })
@@ -1158,88 +879,63 @@ async function handleHealth(sql) {
     await sql`SELECT 1 AS ok`
 
     return json({
-      ok: true,
-      service: 'jack-portal',
-      database: 'connected'
+      ok:true,
+      service:'jack-portal',
+      database:'connected'
     })
-  } catch (error) {
-    console.error('[HEALTH_ERROR]', error)
+  } catch(error) {
+    console.error('[HEALTH_ERROR]',error)
 
-    return json(
-      {
-        ok: false,
-        service: 'jack-portal',
-        database: 'error'
-      },
-      503
-    )
+    return json({
+      ok:false,
+      service:'jack-portal',
+      database:'error'
+    },503)
   }
 }
 
 async function handleStatus(sql) {
   try {
     const result = await sql`
-      SELECT
-        COUNT(*)::int AS total_rooms
+      SELECT COUNT(*)::int AS total_rooms
       FROM chess_rooms
     `
 
     return json({
-      ok: true,
-      total_rooms: result[0]?.total_rooms || 0
+      ok:true,
+      total_rooms:result[0]?.total_rooms || 0
     })
-  } catch (error) {
-    console.error('[STATUS_ERROR]', error)
-
-    return json(
-      {
-        ok: false,
-        error: 'INTERNAL_SERVER_ERROR'
-      },
-      500
-    )
+  } catch(error) {
+    console.error('[STATUS_ERROR]',error)
+    return json({ok:false,error:'INTERNAL_SERVER_ERROR'},500)
   }
 }
 
-async function handleRooms(sql, url) {
-  const search = cleanSearch(
-    url.searchParams.get('search')
-  )
+async function handleRooms(sql,url) {
+  const search = cleanSearch(url.searchParams.get('search'))
 
   if (search) {
     const pattern = `%${search}%`
 
     const rooms = await sql`
-      SELECT
-        room_code,
-        status,
-        updated_at
+      SELECT room_code,status,updated_at
       FROM chess_rooms
       WHERE room_code ILIKE ${pattern}
       ORDER BY updated_at DESC
       LIMIT 50
     `
 
-    return json({
-      ok: true,
-      rooms
-    })
+    return json({ok:true,rooms})
   }
 
   const rooms = await sql`
-    SELECT
-      room_code,
-      status,
-      updated_at
+    SELECT room_code,status,updated_at
     FROM chess_rooms
     ORDER BY updated_at DESC
     LIMIT 50
   `
 
-  return json({
-    ok: true,
-    rooms
-  })
+  return json({ok:true,rooms})
 }
 
 async function handleLeaderboard(sql) {
@@ -1251,15 +947,9 @@ async function handleLeaderboard(sql) {
       LIMIT 100
     `
 
-    return json({
-      ok: true,
-      leaderboard: result
-    })
+    return json({ok:true,leaderboard:result})
   } catch {
-    return json({
-      ok: true,
-      leaderboard: []
-    })
+    return json({ok:true,leaderboard:[]})
   }
 }
 
@@ -1267,138 +957,70 @@ function homePage() {
   return `<!doctype html>
 <html lang="id">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-
-  <title>JACK Portal</title>
-
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-      background: #070a10;
-      color: #fff;
-      font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-    }
-
-    .box {
-      text-align: center;
-      max-width: 520px;
-    }
-
-    .logo {
-      width: 80px;
-      height: 80px;
-      border-radius: 22px;
-      margin: 0 auto 22px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #fff;
-      color: #080b10;
-      font-weight: 900;
-      font-size: 27px;
-      letter-spacing: -2px;
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 30px;
-    }
-
-    p {
-      color: #858fa0;
-      line-height: 1.6;
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JACK Portal</title>
+<style>
+body{
+ margin:0;min-height:100vh;display:flex;align-items:center;
+ justify-content:center;background:#070a10;color:#fff;
+ font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
+}
+.box{text-align:center}
+.logo{
+ width:80px;height:80px;border-radius:22px;background:#fff;color:#080b10;
+ display:flex;align-items:center;justify-content:center;
+ margin:auto auto 20px;font-weight:900;font-size:27px
+}
+p{color:#858fa0}
+</style>
 </head>
-
 <body>
-  <main class="box">
-    <div class="logo">JP</div>
-
-    <h1>JACK Portal</h1>
-
-    <p>
-      Portal service is running normally.
-    </p>
-  </main>
+<main class="box">
+<div class="logo">JP</div>
+<h1>JACK Portal</h1>
+<p>Portal service is running normally.</p>
+</main>
 </body>
 </html>`
 }
 
-async function router(request, env) {
+async function router(request,env) {
   const url = new URL(request.url)
   const pathname = normalizePath(request.url)
   const method = request.method.toUpperCase()
-
   const sql = getSql(env)
 
-  /*
-   * HEALTH CHECK
-   *
-   * Sengaja dijalankan sebelum cleanup.
-   * Jadi kalau cleanup/schema chess bermasalah,
-   * /health tetap bisa memberi diagnosis database.
-   */
   if (pathname === '/health') {
     return handleHealth(sql)
   }
 
-  /*
-   * ADMIN ROUTER
-   */
   if (pathname === '/admin/login') {
-    return handleAdminLogin(request, sql)
+    return handleAdminLogin(request,sql)
   }
 
   if (pathname === '/admin/logout') {
-    return handleAdminLogout(request, sql)
+    return handleAdminLogout(request,sql)
   }
 
   if (pathname === '/admin') {
     if (method !== 'GET') {
-      return json(
-        {
-          ok: false,
-          error: 'METHOD_NOT_ALLOWED'
-        },
-        405
-      )
+      return json({ok:false,error:'METHOD_NOT_ALLOWED'},405)
     }
 
-    return handleAdmin(request, sql, url)
+    return handleAdmin(request,sql,url)
   }
 
   if (pathname === '/admin/rooms/delete') {
-    return handleAdminDelete(request, sql)
+    return handleAdminDelete(request,sql)
   }
 
-  /*
-   * CLEANUP
-   *
-   * Error cleanup tidak boleh membuat API utama
-   * menjadi INTERNAL_SERVER_ERROR.
-   */
+  if (pathname === '/admin/settings') {
+    return handleAdminSettings(request,sql)
+  }
+
   await cleanupStaleRooms(sql)
 
-  /*
-   * PUBLIC ROUTER
-   */
   if (pathname === '/') {
     return html(homePage())
   }
@@ -1408,89 +1030,47 @@ async function router(request, env) {
   }
 
   if (pathname === '/rooms') {
-    return handleRooms(sql, url)
+    return handleRooms(sql,url)
   }
 
   if (pathname === '/leaderboard') {
     return handleLeaderboard(sql)
   }
 
-  /*
-   * CHESS ROUTER
-   *
-   * Route chess utama tetap bisa dipasang di bawah sini.
-   * Bagian ini sengaja tidak mengarang struktur payload
-   * project lama yang belum terlihat di file terbaru.
-   */
-
   if (
     pathname === '/api/chess/create' ||
     pathname === '/api/chess/join' ||
     pathname.startsWith('/api/chess/')
   ) {
-    return json(
-      {
-        ok: false,
-        error: 'CHESS_ROUTE_NOT_CONFIGURED'
-      },
-      501
-    )
+    return json({
+      ok:false,
+      error:'CHESS_ROUTE_NOT_CONFIGURED'
+    },501)
   }
 
-  return json(
-    {
-      ok: false,
-      error: 'NOT_FOUND'
-    },
-    404
-  )
+  return json({
+    ok:false,
+    error:'NOT_FOUND'
+  },404)
 }
 
 export async function onRequest(context) {
   try {
-    return await router(
-      context.request,
-      context.env
-    )
-  } catch (error) {
-    console.error('[PORTAL_ERROR]', error)
+    return await router(context.request,context.env)
+  } catch(error) {
+    console.error('[PORTAL_ERROR]',error)
 
     if (error?.message === 'BODY_TOO_LARGE') {
-      return json(
-        {
-          ok: false,
-          error: 'BODY_TOO_LARGE'
-        },
-        413
-      )
-    }
-
-    if (error?.message === 'INVALID_JSON') {
-      return json(
-        {
-          ok: false,
-          error: 'INVALID_JSON'
-        },
-        400
-      )
+      return json({ok:false,error:'BODY_TOO_LARGE'},413)
     }
 
     if (error?.message === 'INVALID_CONTENT_TYPE') {
-      return json(
-        {
-          ok: false,
-          error: 'INVALID_CONTENT_TYPE'
-        },
-        415
-      )
+      return json({ok:false,error:'INVALID_CONTENT_TYPE'},415)
     }
 
-    return json(
-      {
-        ok: false,
-        error: 'INTERNAL_SERVER_ERROR'
-      },
-      500
-    )
+    return json({
+      ok:false,
+      error:'INTERNAL_SERVER_ERROR'
+    },500)
   }
 }
