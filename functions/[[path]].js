@@ -1867,7 +1867,15 @@ async function router(request,env) {
   // Pastiin tabel chess_rooms/chess_matches/chess_leaderboard selalu ada
   // sebelum route manapun (termasuk admin dashboard) query ke sana.
   // Cegah "relation does not exist" pas fresh deploy / belum ada game sama sekali.
-  await ensureChessTables(sql)
+  // Dibungkus try/catch: kalau proses bikin tabel ini gagal (misal kolom bentrok
+  // sama tabel lama), JANGAN sampai ikut nge-down-in seluruh portal (home/admin/dll).
+  // Route yang beneran butuh tabel chess (create/join/sync/rooms/leaderboard) akan
+  // gagal sendiri dengan pesan error yang jelas, bukan portal-nya total mati.
+  try {
+    await ensureChessTables(sql)
+  } catch (error) {
+    console.error('[CHESS_TABLES_ERROR]', error)
+  }
 
   if (pathname === '/health') {
     return handleHealth(sql)
@@ -1957,7 +1965,9 @@ export async function onRequest(context) {
 
     return json({
       ok:false,
-      error:'INTERNAL_SERVER_ERROR'
+      error:'INTERNAL_SERVER_ERROR',
+      // TODO: cabut field "detail" ini kalau udah stabil, ini cuma buat debug sementara
+      detail: String(error?.message || error)
     },500)
   }
 }
