@@ -174,6 +174,560 @@ async function cleanupStaleRooms(sql) {
   }
 }
 
+/*
+ * =========================================================
+ * CHESS API
+ *
+ * Portal ini yang jadi gateway publik buat game chess bot:
+ * - bot manggil /api/chess/create & /api/chess/join buat bikin room
+ * - board HTML yang dikirim ke user manggil /api/chess/:roomCode
+ *   buat ambil state & kirim move (polling tiap 1.2 detik)
+ * - hasil pertandingan dicatat ke chess_matches, rating pemain
+ *   di-update di chess_leaderboard buat ditampilin di /leaderboard
+ *   & dashboard admin
+ * =========================================================
+ */
+
+const CHESS_RATING_STEP = 20
+const CHESS_RATING_DEFAULT = 1000
+const CHESS_ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+
+let chessTablesReady = false
+
+function chessCorsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  }
+}
+
+function chessJson(data, status = 200) {
+  return json(data, status, chessCorsHeaders())
+}
+
+function cleanChessPlayer(value) {
+  return cleanText(value, 150)
+}
+
+function cleanChessRoom(value) {
+  return String(value ?? '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 20)
+}
+
+function newChessToken() {
+  return randomToken(20)
+}
+
+function makeChessRoomCode() {
+  const bytes = new Uint8Array(8)
+  crypto.getRandomValues(bytes)
+
+  let out = ''
+
+  for (let i = 0; i < 8; i++) {
+    out += CHESS_ROOM_CODE_CHARS[bytes[i] % CHESS_ROOM_CODE_CHARS.length]
+  }
+
+  return out
+}
+
+function chessInitialBoard() {
+  const back = ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r']
+  const board = Array.from({ length: 8 }, () => Array(8).fill(null))
+
+  for (let c = 0; c < 8; c++) {
+    board[0][c] = { color: 'b', type: back[c] }
+    board[1][c] = { color: 'b', type: 'p' }
+    board[6][c] = { color: 'w', type: 'p' }
+    board[7][c] = { color: 'w', type: back[c] }
+  }
+
+  return board
+}
+
+function chessDefaultCastle() {
+  return { w: { k: true, q: true }, b: { k: true, q: true } }
+}
+
+function chessDefaultCaptured() {
+  return { w: [], b: [] }
+}
+
+async function readChessJsonBody(request) {
+  const text = await readRequestBody(request)
+
+  if (!text) return {}
+
+  try {
+    return JSON.parse(text)
+  } catch {
+    return {}
+  }
+}
+
+async function ensureChessTables(sql) {
+  if (chessTablesReady) return
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS chess_rooms (
+      room_code VARCHAR(20) PRIMARY KEY,
+      status VARCHAR(20) NOT NULL DEFAULT 'waiting',
+      white_player VARCHAR(150),
+      black_player VARCHAR(150),
+      white_token VARCHAR(64),
+      black_token VARCHAR(64),
+      turn CHAR(1) NOT NULL DEFAULT 'w',
+      board JSONB NOT NULL,
+      castle JSONB NOT NULL,
+      en_passant JSONB,
+      halfmove INT NOT NULL DEFAULT 0,
+      captured JSONB NOT NULL,
+      move_count INT NOT NULL DEFAULT 0,
+      winner CHAR(1),
+      result VARCHAR(20),
+      version BIGINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finished_at TIMESTAMPTZ
+    )
+  `
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS chess_rooms_updated_at_idx
+    ON chess_rooms (updated_at)
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS chess_matches (
+      id BIGSERIAL PRIMARY KEY,
+      room_code VARCHAR(20) NOT NULL,
+      white_player VARCHAR(150),
+      black_player VARCHAR(150),
+      winner VARCHAR(150),
+      result VARCHAR(20),
+      move_count INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS chess_matches_created_at_idx
+    ON chess_matches (created_at)
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS chess_leaderboard (
+      username VARCHAR(150) PRIMARY KEY,
+      rating INT NOT NULL DEFAULT 1000,
+      wins INT NOT NULL DEFAULT 0,
+      losses INT NOT NULL DEFAULT 0,
+      draws INT NOT NULL DEFAULT 0,
+      games INT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+
+  chessTablesReady = true
+}
+
+async function getChessRoom(sql, roomCode) {
+  const rows = await sql`
+    SELECT *
+    FROM chess_rooms
+    WHERE room_code = ${roomCode}
+    LIMIT 1
+  `
+
+  return rows[0] || null
+}
+
+function chessColorFromToken(row, token) {
+  if (!token) return null
+  if (row.white_token && token === row.white_token) return 'w'
+  if (row.black_token && token === row.black_token) return 'b'
+  return null
+}
+
+function toChessGamePayload(row) {
+  return {
+    ok: true,
+    id: row.room_code,
+    roomCode: row.room_code,
+    board: row.board,
+    turn: row.turn,
+    castle: row.castle,
+    enPassant: row.en_passant ?? null,
+    halfmove: row.halfmove,
+    captured: row.captured,
+    moveCount: row.move_count,
+    status: row.status,
+    winner: row.winner,
+    version: Number(row.version)
+  }
+}
+
+async function createChessRoom(sql, player) {
+  let roomCode = null
+
+  for (let i = 0; i < 10; i++) {
+    const candidate = makeChessRoomCode()
+    const existing = await getChessRoom(sql, candidate)
+
+    if (!existing) {
+      roomCode = candidate
+      break
+    }
+  }
+
+  if (!roomCode) {
+    throw new Error('Gagal membuat room code')
+  }
+
+  const token = newChessToken()
+
+  const board = JSON.stringify(chessInitialBoard())
+  const castle = JSON.stringify(chessDefaultCastle())
+  const captured = JSON.stringify(chessDefaultCaptured())
+
+  const rows = await sql`
+    INSERT INTO chess_rooms (
+      room_code, status, white_player, white_token,
+      turn, board, castle, en_passant, halfmove, captured, move_count, version
+    )
+    VALUES (
+      ${roomCode}, 'waiting', ${player}, ${token},
+      'w', ${board}::jsonb, ${castle}::jsonb, NULL, 0, ${captured}::jsonb, 0, 0
+    )
+    RETURNING *
+  `
+
+  const row = rows[0]
+
+  return {
+    ...toChessGamePayload(row),
+    token,
+    color: 'w',
+    room_code: row.room_code
+  }
+}
+
+async function joinChessRoom(sql, roomCode, player) {
+  const row = await getChessRoom(sql, roomCode)
+
+  if (!row) {
+    return { error: 'ROOM_NOT_FOUND' }
+  }
+
+  if (row.white_player === player) {
+    return {
+      ...toChessGamePayload(row),
+      token: row.white_token,
+      color: 'w',
+      room_code: row.room_code
+    }
+  }
+
+  if (row.black_player === player) {
+    return {
+      ...toChessGamePayload(row),
+      token: row.black_token,
+      color: 'b',
+      room_code: row.room_code
+    }
+  }
+
+  if (row.black_player) {
+    return { error: 'ROOM_FULL' }
+  }
+
+  const token = newChessToken()
+
+  const updated = await sql`
+    UPDATE chess_rooms
+    SET black_player = ${player}, black_token = ${token},
+        status = 'playing', updated_at = NOW()
+    WHERE room_code = ${roomCode} AND black_player IS NULL
+    RETURNING *
+  `
+
+  if (!updated.length) {
+    const fresh = await getChessRoom(sql, roomCode)
+
+    if (fresh?.black_player === player) {
+      return {
+        ...toChessGamePayload(fresh),
+        token: fresh.black_token,
+        color: 'b',
+        room_code: fresh.room_code
+      }
+    }
+
+    return { error: 'ROOM_FULL' }
+  }
+
+  const fresh = updated[0]
+
+  return {
+    ...toChessGamePayload(fresh),
+    token,
+    color: 'b',
+    room_code: fresh.room_code
+  }
+}
+
+async function recordChessMatch(sql, row, winnerColor, resultLabel) {
+  const winnerName =
+    winnerColor === 'w'
+      ? row.white_player
+      : winnerColor === 'b'
+        ? row.black_player
+        : null
+
+  const loserName =
+    winnerColor === 'w'
+      ? row.black_player
+      : winnerColor === 'b'
+        ? row.white_player
+        : null
+
+  await sql`
+    INSERT INTO chess_matches (
+      room_code, white_player, black_player, winner, result, move_count
+    )
+    VALUES (
+      ${row.room_code}, ${row.white_player}, ${row.black_player},
+      ${winnerName}, ${resultLabel}, ${row.move_count}
+    )
+  `
+
+  if (winnerName) {
+    await sql`
+      INSERT INTO chess_leaderboard (username, rating, wins, losses, draws, games, updated_at)
+      VALUES (${winnerName}, ${CHESS_RATING_DEFAULT + CHESS_RATING_STEP}, 1, 0, 0, 1, NOW())
+      ON CONFLICT (username) DO UPDATE SET
+        rating = chess_leaderboard.rating + ${CHESS_RATING_STEP},
+        wins = chess_leaderboard.wins + 1,
+        games = chess_leaderboard.games + 1,
+        updated_at = NOW()
+    `
+  }
+
+  if (loserName) {
+    await sql`
+      INSERT INTO chess_leaderboard (username, rating, wins, losses, draws, games, updated_at)
+      VALUES (${loserName}, ${Math.max(0, CHESS_RATING_DEFAULT - CHESS_RATING_STEP)}, 0, 1, 0, 1, NOW())
+      ON CONFLICT (username) DO UPDATE SET
+        rating = GREATEST(0, chess_leaderboard.rating - ${CHESS_RATING_STEP}),
+        losses = chess_leaderboard.losses + 1,
+        games = chess_leaderboard.games + 1,
+        updated_at = NOW()
+    `
+  }
+
+  if (!winnerName && !loserName) {
+    for (const name of [row.white_player, row.black_player].filter(Boolean)) {
+      await sql`
+        INSERT INTO chess_leaderboard (username, rating, wins, losses, draws, games, updated_at)
+        VALUES (${name}, ${CHESS_RATING_DEFAULT}, 0, 0, 1, 1, NOW())
+        ON CONFLICT (username) DO UPDATE SET
+          draws = chess_leaderboard.draws + 1,
+          games = chess_leaderboard.games + 1,
+          updated_at = NOW()
+      `
+    }
+  }
+}
+
+async function syncChessRoom(sql, roomCode, body) {
+  const row = await getChessRoom(sql, roomCode)
+
+  if (!row) {
+    return { status: 404, data: { ok: false, error: 'ROOM_NOT_FOUND' } }
+  }
+
+  const playerColor = chessColorFromToken(row, body.token)
+
+  if (!playerColor) {
+    return { status: 403, data: { ok: false, error: 'INVALID_TOKEN' } }
+  }
+
+  if (body.resign === true) {
+    if (row.status === 'finished') {
+      return { status: 200, data: toChessGamePayload(row) }
+    }
+
+    const winnerColor = playerColor === 'w' ? 'b' : 'w'
+    const nextVersion = Number(row.version) + 1
+
+    const updated = await sql`
+      UPDATE chess_rooms
+      SET status = 'finished', winner = ${winnerColor}, result = 'resign',
+          version = ${nextVersion}, updated_at = NOW(), finished_at = NOW()
+      WHERE room_code = ${roomCode} AND version = ${row.version}
+      RETURNING *
+    `
+
+    if (!updated.length) {
+      return { status: 409, data: { ok: false, error: 'STALE_VERSION' } }
+    }
+
+    const fresh = updated[0]
+
+    await recordChessMatch(sql, fresh, winnerColor, 'resign').catch(error => {
+      console.error('[CHESS_MATCH_ERROR]', error)
+    })
+
+    return { status: 200, data: toChessGamePayload(fresh) }
+  }
+
+  if (row.status === 'finished') {
+    return { status: 409, data: { ok: false, error: 'GAME_FINISHED' } }
+  }
+
+  if (row.status !== 'playing') {
+    return { status: 409, data: { ok: false, error: 'WAITING_FOR_PLAYER' } }
+  }
+
+  if (row.turn !== playerColor) {
+    return { status: 409, data: { ok: false, error: 'NOT_YOUR_TURN' } }
+  }
+
+  const clientVersion = Number(body.version)
+
+  if (
+    Number.isFinite(clientVersion) &&
+    clientVersion !== Number(row.version)
+  ) {
+    return { status: 409, data: { ok: false, error: 'STALE_VERSION' } }
+  }
+
+  const nextTurn = playerColor === 'w' ? 'b' : 'w'
+  const nextVersion = Number(row.version) + 1
+  const finished = body.status === 'finished'
+
+  const winner =
+    finished && (body.winner === 'w' || body.winner === 'b')
+      ? body.winner
+      : null
+
+  const board = JSON.stringify(body.board ?? row.board)
+  const castle = JSON.stringify(body.castle ?? row.castle)
+  const enPassant = body.enPassant != null ? JSON.stringify(body.enPassant) : null
+  const captured = JSON.stringify(body.captured ?? row.captured)
+
+  const updated = await sql`
+    UPDATE chess_rooms
+    SET
+      turn = ${nextTurn},
+      board = ${board}::jsonb,
+      castle = ${castle}::jsonb,
+      en_passant = ${enPassant}::jsonb,
+      halfmove = ${Number(body.halfmove || 0)},
+      captured = ${captured}::jsonb,
+      move_count = ${Number(body.moveCount || 0)},
+      status = ${finished ? 'finished' : 'playing'},
+      winner = ${winner},
+      result = ${finished ? (winner ? 'checkmate' : 'draw') : null},
+      version = ${nextVersion},
+      updated_at = NOW(),
+      finished_at = CASE WHEN ${finished} THEN NOW() ELSE finished_at END
+    WHERE room_code = ${roomCode} AND version = ${row.version}
+    RETURNING *
+  `
+
+  if (!updated.length) {
+    return { status: 409, data: { ok: false, error: 'STALE_VERSION' } }
+  }
+
+  const fresh = updated[0]
+
+  if (finished) {
+    await recordChessMatch(sql, fresh, winner, winner ? 'checkmate' : 'draw').catch(error => {
+      console.error('[CHESS_MATCH_ERROR]', error)
+    })
+  }
+
+  return { status: 200, data: toChessGamePayload(fresh) }
+}
+
+async function handleChessCreate(request, sql) {
+  const body = await readChessJsonBody(request)
+  const player = cleanChessPlayer(body.player || body.playerId || body.jid)
+
+  if (!player) {
+    return chessJson({ ok: false, error: 'PLAYER_REQUIRED' }, 400)
+  }
+
+  await ensureChessTables(sql)
+  const created = await createChessRoom(sql, player)
+
+  return chessJson(created, 200)
+}
+
+async function handleChessJoin(request, sql) {
+  const body = await readChessJsonBody(request)
+
+  const roomCode = cleanChessRoom(body.room || body.roomCode || body.code)
+  const player = cleanChessPlayer(body.player || body.playerId || body.jid)
+
+  if (!roomCode || !player) {
+    return chessJson({ ok: false, error: 'ROOM_AND_PLAYER_REQUIRED' }, 400)
+  }
+
+  await ensureChessTables(sql)
+  const joined = await joinChessRoom(sql, roomCode, player)
+
+  if (joined.error === 'ROOM_NOT_FOUND') {
+    return chessJson({ ok: false, error: 'ROOM_NOT_FOUND' }, 404)
+  }
+
+  if (joined.error === 'ROOM_FULL') {
+    return chessJson({ ok: false, error: 'ROOM_FULL' }, 409)
+  }
+
+  return chessJson(joined, 200)
+}
+
+async function handleChessRoom(request, sql, url, pathname, method) {
+  const roomCode = cleanChessRoom(
+    decodeURIComponent(pathname.slice('/api/chess/'.length))
+  )
+
+  if (!roomCode) {
+    return chessJson({ ok: false, error: 'INVALID_ROOM_CODE' }, 400)
+  }
+
+  await ensureChessTables(sql)
+
+  if (method === 'GET') {
+    const token = url.searchParams.get('token') || ''
+    const row = await getChessRoom(sql, roomCode)
+
+    if (!row) {
+      return chessJson({ ok: false, error: 'ROOM_NOT_FOUND' }, 404)
+    }
+
+    if (!chessColorFromToken(row, token)) {
+      return chessJson({ ok: false, error: 'INVALID_TOKEN' }, 403)
+    }
+
+    return chessJson(toChessGamePayload(row), 200)
+  }
+
+  if (method === 'POST') {
+    const body = await readChessJsonBody(request)
+    const result = await syncChessRoom(sql, roomCode, body)
+
+    return chessJson(result.data, result.status)
+  }
+
+  return chessJson({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405)
+}
+
 async function createAdminSession(sql, adminId, request) {
   const rawToken = randomToken(32)
   const tokenHash = await sha256(rawToken)
@@ -896,14 +1450,17 @@ async function handleHealth(sql) {
 
 async function handleStatus(sql) {
   try {
-    const result = await sql`
-      SELECT COUNT(*)::int AS total_rooms
-      FROM chess_rooms
-    `
+    const [rooms, players, matches] = await Promise.all([
+      sql`SELECT COUNT(*)::int AS n FROM chess_rooms WHERE status IN ('waiting','playing')`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_leaderboard`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_matches`
+    ])
 
     return json({
       ok:true,
-      total_rooms:result[0]?.total_rooms || 0
+      total_rooms:rooms[0]?.n || 0,
+      total_players:players[0]?.n || 0,
+      total_matches:matches[0]?.n || 0
     })
   } catch(error) {
     console.error('[STATUS_ERROR]',error)
@@ -911,78 +1468,384 @@ async function handleStatus(sql) {
   }
 }
 
-async function handleRooms(sql,url) {
-  const search = cleanSearch(url.searchParams.get('search'))
+async function getPortalStats(sql) {
+  try {
+    const [rooms, players, matches] = await Promise.all([
+      sql`SELECT COUNT(*)::int AS n FROM chess_rooms WHERE status IN ('waiting','playing')`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_leaderboard`,
+      sql`SELECT COUNT(*)::int AS n FROM chess_matches`
+    ])
 
+    return {
+      activeRooms: rooms[0]?.n || 0,
+      totalPlayers: players[0]?.n || 0,
+      totalMatches: matches[0]?.n || 0
+    }
+  } catch(error) {
+    console.error('[STATS_ERROR]',error)
+    return { activeRooms:0, totalPlayers:0, totalMatches:0 }
+  }
+}
+
+async function getActiveChessRooms(sql, search) {
   if (search) {
     const pattern = `%${search}%`
 
-    const rooms = await sql`
-      SELECT room_code,status,updated_at
+    return sql`
+      SELECT room_code,status,white_player,black_player,turn,updated_at
       FROM chess_rooms
-      WHERE room_code ILIKE ${pattern}
+      WHERE status IN ('waiting','playing')
+        AND room_code ILIKE ${pattern}
       ORDER BY updated_at DESC
       LIMIT 50
     `
-
-    return json({ok:true,rooms})
   }
 
-  const rooms = await sql`
-    SELECT room_code,status,updated_at
+  return sql`
+    SELECT room_code,status,white_player,black_player,turn,updated_at
     FROM chess_rooms
+    WHERE status IN ('waiting','playing')
     ORDER BY updated_at DESC
     LIMIT 50
   `
-
-  return json({ok:true,rooms})
 }
 
-async function handleLeaderboard(sql) {
-  try {
-    const result = await sql`
-      SELECT *
-      FROM chess_leaderboard
-      ORDER BY rating DESC
-      LIMIT 100
-    `
+async function getChessLeaderboardRows(sql) {
+  return sql`
+    SELECT username,rating,wins,losses,draws,games
+    FROM chess_leaderboard
+    ORDER BY rating DESC, games DESC
+    LIMIT 100
+  `
+}
 
-    return json({ok:true,leaderboard:result})
-  } catch {
+async function handleRoomsApi(sql,url) {
+  try {
+    const rooms = await getActiveChessRooms(sql, cleanSearch(url.searchParams.get('search')))
+    return json({ok:true,rooms})
+  } catch(error) {
+    console.error('[ROOMS_API_ERROR]',error)
+    return json({ok:false,error:'INTERNAL_SERVER_ERROR'},500)
+  }
+}
+
+async function handleLeaderboardApi(sql) {
+  try {
+    const leaderboard = await getChessLeaderboardRows(sql)
+    return json({ok:true,leaderboard})
+  } catch(error) {
+    console.error('[LEADERBOARD_API_ERROR]',error)
     return json({ok:true,leaderboard:[]})
   }
 }
 
-function homePage() {
-  return `<!doctype html>
+/*
+ * =========================================================
+ * TAMPILAN PUBLIK (home / rooms / leaderboard)
+ * =========================================================
+ */
+
+function timeAgo(value) {
+  const time = value instanceof Date ? value.getTime() : new Date(value).getTime()
+
+  if (!Number.isFinite(time)) return '-'
+
+  const diff = Math.max(0, Date.now() - time)
+  const sec = Math.floor(diff / 1000)
+
+  if (sec < 60) return 'baru saja'
+
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min} menit lalu`
+
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr} jam lalu`
+
+  return `${Math.floor(hr / 24)} hari lalu`
+}
+
+function publicPageStyles() {
+  return `
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+ min-height:100vh;background:
+  radial-gradient(circle at top,#1b1224 0,#0a0b10 45%,#06070b 100%);
+ color:#f4f2f8;
+ font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+ padding:28px 18px 60px
+}
+a{color:inherit}
+.wrap{width:100%;max-width:880px;margin:0 auto}
+.topnav{
+ display:flex;align-items:center;justify-content:space-between;
+ gap:14px;margin-bottom:34px;flex-wrap:wrap
+}
+.brand{display:flex;align-items:center;gap:12px;text-decoration:none}
+.brand .mark{
+ width:42px;height:42px;border-radius:13px;
+ background:linear-gradient(135deg,#ff6fae,#7c4dff);
+ display:flex;align-items:center;justify-content:center;
+ font-weight:900;font-size:15px;color:#fff;flex-shrink:0
+}
+.brand strong{display:block;font-size:16px;letter-spacing:-.3px}
+.brand span{display:block;color:#8b93a5;font-size:11.5px;margin-top:1px}
+.navlinks{display:flex;gap:8px;flex-wrap:wrap}
+.navlinks a{
+ text-decoration:none;font-size:13px;font-weight:600;color:#c6cbdb;
+ padding:9px 14px;border-radius:10px;border:1px solid #232433;
+ background:rgba(255,255,255,.02);transition:.15s
+}
+.navlinks a:hover{background:rgba(255,255,255,.06);color:#fff}
+.navlinks a.active{
+ background:linear-gradient(135deg,#ff6fae,#7c4dff);
+ border-color:transparent;color:#fff
+}
+.hero{text-align:center;margin-bottom:30px}
+.hero h1{margin:0 0 8px;font-size:30px;letter-spacing:-.6px}
+.hero p{margin:0;color:#9aa1b4;font-size:14.5px;line-height:1.6}
+.stats{
+ display:grid;grid-template-columns:repeat(3,1fr);gap:12px;
+ margin:26px 0
+}
+.stat{
+ background:#0f0e17;border:1px solid #24232f;border-radius:16px;
+ padding:16px 14px;text-align:center
+}
+.stat strong{display:block;font-size:23px;font-weight:800}
+.stat span{display:block;color:#8b8fa0;font-size:11px;margin-top:4px;text-transform:uppercase;letter-spacing:.4px}
+.menu{display:flex;flex-direction:column;gap:12px;margin-top:8px}
+a.card{
+ display:flex;align-items:center;justify-content:space-between;gap:12px;
+ padding:20px;border-radius:16px;text-decoration:none;font-weight:700;font-size:16px;
+ background:linear-gradient(135deg,#ff5fa5,#7c4dff);color:#fff;
+ box-shadow:0 16px 40px rgba(124,77,255,.22)
+}
+a.card.alt{background:linear-gradient(135deg,#3fb8ff,#4d6bff);box-shadow:0 16px 40px rgba(63,184,255,.18)}
+a.card .arrow{font-size:20px;opacity:.85}
+.note{margin-top:26px;text-align:center;font-size:12.5px;color:#6d7285;line-height:1.7}
+.note b{color:#c6cbdb}
+.panel{
+ background:#0f0e17;border:1px solid #24232f;border-radius:18px;
+ overflow:hidden;margin-top:6px
+}
+.panel-head{
+ padding:18px 20px;border-bottom:1px solid #21212d;
+ display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap
+}
+.panel-head h2{margin:0;font-size:16px}
+.panel-head .sub{font-size:12px;color:#7d8296;margin-top:3px}
+.search-form{display:flex;gap:8px}
+.search-form input{
+ background:#0a0a11;border:1px solid #262735;color:#fff;
+ border-radius:10px;padding:9px 12px;font-size:13px;outline:none;min-width:0
+}
+.search-form input:focus{border-color:#7c4dff}
+.search-form button{
+ border:0;border-radius:10px;padding:0 15px;font-weight:700;
+ background:#fff;color:#0a0a11;cursor:pointer;font-size:13px
+}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:560px}
+th,td{padding:13px 20px;text-align:left;font-size:13px;border-bottom:1px solid #1b1b26}
+th{color:#767c90;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;font-weight:700}
+tr:last-child td{border-bottom:0}
+td code{background:#191926;padding:3px 8px;border-radius:7px;font-size:12.5px;letter-spacing:.5px}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:4px 10px;border-radius:20px;font-weight:600}
+.badge.playing{background:#13291d;color:#7ee6a3}
+.badge.waiting{background:#332612;color:#ffcf7a}
+.badge.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.rank{font-weight:800;width:26px;display:inline-block;text-align:center}
+.rank.gold{color:#ffd166}
+.rank.silver{color:#d9d9e3}
+.rank.bronze{color:#e0a06b}
+.you-lead{color:#fff;font-weight:700}
+.win{color:#7ee6a3}
+.loss{color:#ff8f9c}
+.empty{text-align:center;color:#6d7285;padding:48px 20px;font-size:13.5px}
+.footer-link{display:block;text-align:center;margin-top:24px;font-size:13px;color:#9aa1b4;text-decoration:none}
+.footer-link:hover{color:#fff}
+@media(max-width:640px){
+ .stats{grid-template-columns:1fr}
+ .panel-head{flex-direction:column;align-items:stretch}
+ .search-form{width:100%}
+ .search-form input{flex:1}
+ th,td{padding:12px 14px}
+ table{min-width:520px}
+}
+`
+}
+
+function publicTopNav(active) {
+  const items = [
+    { href:'/', label:'Home', key:'home' },
+    { href:'/rooms', label:'Room Aktif', key:'rooms' },
+    { href:'/leaderboard', label:'Leaderboard', key:'leaderboard' }
+  ]
+
+  return `
+<div class="topnav">
+<a class="brand" href="/">
+<div class="mark">JP</div>
+<div>
+<strong>JACK Portal</strong>
+<span>Chess Online Gateway</span>
+</div>
+</a>
+<nav class="navlinks">
+${items.map(item => `<a href="${item.href}"${item.key === active ? ' class="active"' : ''}>${item.label}</a>`).join('')}
+</nav>
+</div>`
+}
+
+async function handleHome(sql) {
+  const stats = await getPortalStats(sql)
+
+  return html(`<!doctype html>
 <html lang="id">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>JACK Portal</title>
-<style>
-body{
- margin:0;min-height:100vh;display:flex;align-items:center;
- justify-content:center;background:#070a10;color:#fff;
- font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
-}
-.box{text-align:center}
-.logo{
- width:80px;height:80px;border-radius:22px;background:#fff;color:#080b10;
- display:flex;align-items:center;justify-content:center;
- margin:auto auto 20px;font-weight:900;font-size:27px
-}
-p{color:#858fa0}
-</style>
+<style>${publicPageStyles()}</style>
 </head>
 <body>
-<main class="box">
-<div class="logo">JP</div>
-<h1>JACK Portal</h1>
-<p>Portal service is running normally.</p>
+<main class="wrap">
+${publicTopNav('home')}
+
+<section class="hero">
+<h1>♟️ JACK Portal</h1>
+<p>Gateway online buat Qiro Ai Chess — main tetap di WhatsApp,<br>di sini cuma buat pantau room &amp; leaderboard.</p>
+</section>
+
+<div class="stats">
+<div class="stat"><strong>${stats.activeRooms}</strong><span>Room Aktif</span></div>
+<div class="stat"><strong>${stats.totalPlayers}</strong><span>Pemain Tercatat</span></div>
+<div class="stat"><strong>${stats.totalMatches}</strong><span>Match Selesai</span></div>
+</div>
+
+<div class="menu">
+<a class="card" href="/rooms">🎮 Room Aktif<span class="arrow">→</span></a>
+<a class="card alt" href="/leaderboard">🏆 Leaderboard<span class="arrow">→</span></a>
+</div>
+
+<div class="note">Mau main? Chat bot-nya di WhatsApp, ketik <b>.chess online</b> atau <b>.catur online</b>.</div>
 </main>
 </body>
-</html>`
+</html>`)
+}
+
+async function handleRoomsPage(sql, url) {
+  const search = cleanSearch(url.searchParams.get('search'))
+  const rows = await getActiveChessRooms(sql, search)
+
+  const body = rows.length
+    ? rows.map(r => {
+        const badge = r.status === 'playing'
+          ? `<span class="badge playing"><span class="badge dot"></span>Main</span>`
+          : `<span class="badge waiting"><span class="badge dot"></span>Nunggu</span>`
+
+        return `<tr>
+<td><code>${escapeHtml(r.room_code)}</code></td>
+<td>${badge}</td>
+<td>${escapeHtml(r.white_player || '-')}</td>
+<td>${escapeHtml(r.black_player || 'menunggu...')}</td>
+<td>${r.turn === 'w' ? '⚪ White' : '⚫ Black'}</td>
+<td>${timeAgo(r.updated_at)}</td>
+</tr>`
+      }).join('')
+    : `<tr><td colspan="6" class="empty">Gak ada room yang lagi aktif. Ketik <b>.chess online</b> di WA buat bikin room baru.</td></tr>`
+
+  return html(`<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>Room Aktif - JACK Portal</title>
+<style>${publicPageStyles()}</style>
+</head>
+<body>
+<main class="wrap">
+${publicTopNav('rooms')}
+
+<section class="panel">
+<div class="panel-head">
+<div>
+<h2>🎮 Room Aktif</h2>
+<div class="sub">Auto-refresh tiap 10 detik</div>
+</div>
+<form class="search-form" method="GET" action="/rooms">
+<input type="search" name="search" value="${escapeHtml(search)}" placeholder="Cari kode room..." maxlength="20">
+<button type="submit">Cari</button>
+</form>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Kode</th><th>Status</th><th>White</th><th>Black</th><th>Giliran</th><th>Update</th></tr></thead>
+<tbody>${body}</tbody>
+</table>
+</div>
+</section>
+
+<a class="footer-link" href="/">← Kembali ke Home</a>
+</main>
+</body>
+</html>`)
+}
+
+async function handleLeaderboardPage(sql) {
+  const rows = await getChessLeaderboardRows(sql)
+
+  const body = rows.length
+    ? rows.map((r, i) => {
+        const rank = i + 1
+        const rankClass = rank === 1 ? 'gold' : rank === 2 ? 'silver' : rank === 3 ? 'bronze' : ''
+        const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`
+
+        return `<tr>
+<td><span class="rank ${rankClass}">${medal}</span></td>
+<td>${escapeHtml(r.username)}</td>
+<td><strong>${r.rating}</strong></td>
+<td class="win">${r.wins}</td>
+<td class="loss">${r.losses}</td>
+<td>${r.draws}</td>
+<td>${r.games}</td>
+</tr>`
+      }).join('')
+    : `<tr><td colspan="7" class="empty">Belum ada game yang selesai. Yuk main dulu di WhatsApp!</td></tr>`
+
+  return html(`<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leaderboard - JACK Portal</title>
+<style>${publicPageStyles()}</style>
+</head>
+<body>
+<main class="wrap">
+${publicTopNav('leaderboard')}
+
+<section class="panel">
+<div class="panel-head">
+<div>
+<h2>🏆 Chess Leaderboard</h2>
+<div class="sub">Diurutin berdasarkan rating</div>
+</div>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>#</th><th>Pemain</th><th>Rating</th><th>W</th><th>L</th><th>D</th><th>Main</th></tr></thead>
+<tbody>${body}</tbody>
+</table>
+</div>
+</section>
+
+<a class="footer-link" href="/">← Kembali ke Home</a>
+</main>
+</body>
+</html>`)
 }
 
 async function router(request,env) {
@@ -990,6 +1853,21 @@ async function router(request,env) {
   const pathname = normalizePath(request.url)
   const method = request.method.toUpperCase()
   const sql = getSql(env)
+
+  if (method === 'OPTIONS' && pathname.startsWith('/api/chess/')) {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        ...securityHeaders(),
+        ...chessCorsHeaders()
+      }
+    })
+  }
+
+  // Pastiin tabel chess_rooms/chess_matches/chess_leaderboard selalu ada
+  // sebelum route manapun (termasuk admin dashboard) query ke sana.
+  // Cegah "relation does not exist" pas fresh deploy / belum ada game sama sekali.
+  await ensureChessTables(sql)
 
   if (pathname === '/health') {
     return handleHealth(sql)
@@ -1022,7 +1900,7 @@ async function router(request,env) {
   await cleanupStaleRooms(sql)
 
   if (pathname === '/') {
-    return html(homePage())
+    return handleHome(sql)
   }
 
   if (pathname === '/api/status') {
@@ -1030,22 +1908,31 @@ async function router(request,env) {
   }
 
   if (pathname === '/rooms') {
-    return handleRooms(sql,url)
+    return handleRoomsPage(sql,url)
+  }
+
+  if (pathname === '/api/rooms') {
+    return handleRoomsApi(sql,url)
   }
 
   if (pathname === '/leaderboard') {
-    return handleLeaderboard(sql)
+    return handleLeaderboardPage(sql)
   }
 
-  if (
-    pathname === '/api/chess/create' ||
-    pathname === '/api/chess/join' ||
-    pathname.startsWith('/api/chess/')
-  ) {
-    return json({
-      ok:false,
-      error:'CHESS_ROUTE_NOT_CONFIGURED'
-    },501)
+  if (pathname === '/api/leaderboard') {
+    return handleLeaderboardApi(sql)
+  }
+
+  if (pathname === '/api/chess/create') {
+    return handleChessCreate(request, sql)
+  }
+
+  if (pathname === '/api/chess/join') {
+    return handleChessJoin(request, sql)
+  }
+
+  if (pathname.startsWith('/api/chess/')) {
+    return handleChessRoom(request, sql, url, pathname, method)
   }
 
   return json({
