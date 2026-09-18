@@ -46,6 +46,24 @@ function html(content, status = 200, extraHeaders = {}) {
   })
 }
 
+// Halaman biasa DILARANG di-iframe (frame-ancestors 'none') buat cegah clickjacking,
+// khususnya admin/login. Tapi beberapa halaman ("bridge") MEMANG harus bisa di-iframe
+// dari mana aja (card WA), makanya pake header terpisah yang izinin embedding,
+// dengan CSP tetep ketat (cuma boleh fetch balik ke portal sendiri + iframe YouTube).
+function embeddableHtml(content, status = 200) {
+  return new Response(content, {
+    status,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
+      'Content-Security-Policy':
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-src https://www.youtube.com; frame-ancestors *; base-uri 'self'"
+    }
+  })
+}
+
 function redirect(url, status = 302) {
   return new Response(null, {
     status,
@@ -194,16 +212,16 @@ const CHESS_ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
 let chessTablesReady = false
 
-function chessCorsHeaders() {
+function apiCorsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
   }
 }
 
 function chessJson(data, status = 200) {
-  return json(data, status, chessCorsHeaders())
+  return json(data, status, apiCorsHeaders())
 }
 
 function cleanChessPlayer(value) {
@@ -257,7 +275,7 @@ function chessDefaultCaptured() {
   return { w: [], b: [] }
 }
 
-async function readChessJsonBody(request) {
+async function readJsonBody(request) {
   const text = await readRequestBody(request)
 
   if (!text) return {}
@@ -655,7 +673,7 @@ async function syncChessRoom(sql, roomCode, body) {
 }
 
 async function handleChessCreate(request, sql) {
-  const body = await readChessJsonBody(request)
+  const body = await readJsonBody(request)
   const player = cleanChessPlayer(body.player || body.playerId || body.jid)
 
   if (!player) {
@@ -669,7 +687,7 @@ async function handleChessCreate(request, sql) {
 }
 
 async function handleChessJoin(request, sql) {
-  const body = await readChessJsonBody(request)
+  const body = await readJsonBody(request)
 
   const roomCode = cleanChessRoom(body.room || body.roomCode || body.code)
   const player = cleanChessPlayer(body.player || body.playerId || body.jid)
@@ -719,13 +737,482 @@ async function handleChessRoom(request, sql, url, pathname, method) {
   }
 
   if (method === 'POST') {
-    const body = await readChessJsonBody(request)
+    const body = await readJsonBody(request)
     const result = await syncChessRoom(sql, roomCode, body)
 
     return chessJson(result.data, result.status)
   }
 
   return chessJson({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405)
+}
+
+/*
+ * =========================================================
+ * MUSIC API
+ *
+ * Bot ngirim card musik (HTML) langsung ke WA, isinya token
+ * HMAC yang dia bikin sendiri (stateless, gak butuh network).
+ * Card itu manggil portal buat search & simpen favorite/history,
+ * portal verifikasi token-nya pake secret yang sama kayak bot.
+ * Playback pake iframe YouTube resmi yang disembunyiin di card,
+ * jadi portal gak perlu proses audio sama sekali.
+ * =========================================================
+ */
+
+let musicTablesReady = false
+
+function musicSecret(env) {
+  return env.MUSIC_SESSION_SECRET || 'change_this_to_a_long_random_secret'
+}
+
+async function musicHmacHex(secret, message) {
+  const enc = new TextEncoder()
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message))
+
+  return [...new Uint8Array(sig)]
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function constantTimeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  if (a.length !== b.length) return false
+
+  let diff = 0
+
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  }
+
+  return diff === 0
+}
+
+async function verifyMusicToken(token, secret) {
+  if (!token || typeof token !== 'string') return null
+
+  const parts = token.split('.')
+  if (parts.length < 3) return null
+
+  const signature = parts.pop()
+  const timestamp = parts.pop()
+  const userId = parts.join('.')
+
+  if (!userId || !timestamp || !signature) return null
+
+  const timestampNumber = Number(timestamp)
+  if (!Number.isFinite(timestampNumber)) return null
+
+  // Token berlaku 30 hari (samain kayak masa berlaku di bot).
+  const maxAge = 30 * 24 * 60 * 60 * 1000
+
+  if (Date.now() - timestampNumber > maxAge) return null
+  if (timestampNumber > Date.now() + 5 * 60 * 1000) return null
+
+  const expected = await musicHmacHex(secret, `${userId}.${timestamp}`)
+
+  if (!constantTimeEqual(signature, expected)) return null
+
+  return { userId, timestamp: timestampNumber }
+}
+
+function getMusicBearerToken(request) {
+  const authorization = request.headers.get('Authorization')
+
+  if (!authorization) return null
+  if (!authorization.toLowerCase().startsWith('bearer ')) return null
+
+  return authorization.slice(7).trim()
+}
+
+async function getAuthenticatedMusicUser(request, env) {
+  const token = getMusicBearerToken(request)
+  if (!token) return null
+
+  return verifyMusicToken(token, musicSecret(env))
+}
+
+async function ensureMusicTables(sql) {
+  if (musicTablesReady) return
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS music_favorites (
+      username VARCHAR(150) NOT NULL,
+      video_id VARCHAR(50) NOT NULL,
+      title VARCHAR(300),
+      artist VARCHAR(200),
+      channel_title VARCHAR(200),
+      thumbnail VARCHAR(500),
+      youtube_url VARCHAR(300),
+      embed_url VARCHAR(300),
+      added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (username, video_id)
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS music_history (
+      id BIGSERIAL PRIMARY KEY,
+      username VARCHAR(150) NOT NULL,
+      video_id VARCHAR(50) NOT NULL,
+      title VARCHAR(300),
+      artist VARCHAR(200),
+      channel_title VARCHAR(200),
+      thumbnail VARCHAR(500),
+      youtube_url VARCHAR(300),
+      embed_url VARCHAR(300),
+      played_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+
+  await sql`
+    CREATE INDEX IF NOT EXISTS music_online_history_user_idx
+    ON music_history (username, played_at DESC)
+  `
+
+  musicTablesReady = true
+}
+
+function normalizeMusicTrack(track) {
+  if (!track || typeof track !== 'object') return null
+
+  const videoId = cleanText(track.videoId || track.id, 100)
+  if (!videoId) return null
+
+  return {
+    id: videoId,
+    videoId,
+    title: cleanText(track.title, 300),
+    artist: cleanText(track.artist || track.channelTitle, 200),
+    channelTitle: cleanText(track.channelTitle || track.artist, 200),
+    thumbnail: cleanText(track.thumbnail, 500) || null,
+    youtubeUrl: `https://www.youtube.com/watch?v=${videoId}`,
+    embedUrl: `https://www.youtube.com/embed/${videoId}`
+  }
+}
+
+function rowToMusicTrack(row) {
+  return {
+    id: row.video_id,
+    videoId: row.video_id,
+    title: row.title,
+    artist: row.artist,
+    channelTitle: row.channel_title,
+    thumbnail: row.thumbnail,
+    youtubeUrl: row.youtube_url,
+    embedUrl: row.embed_url,
+    addedAt: row.added_at || null,
+    playedAt: row.played_at || null
+  }
+}
+
+async function youtubeSearchPortal(query, env) {
+  const apiKey = env.YOUTUBE_API_KEY || ''
+
+  if (!apiKey) {
+    throw new Error('YOUTUBE_API_KEY belum diatur di environment portal')
+  }
+
+  const params = new URLSearchParams({
+    part: 'snippet',
+    q: query,
+    type: 'video',
+    videoCategoryId: '10',
+    maxResults: '15',
+    regionCode: env.YOUTUBE_REGION || 'ID',
+    key: apiKey
+  })
+
+  const url = `https://www.googleapis.com/youtube/v3/search?${params.toString()}`
+  const response = await fetch(url)
+
+  let data
+
+  try {
+    data = await response.json()
+  } catch {
+    throw new Error(`YouTube API mengembalikan response tidak valid (${response.status})`)
+  }
+
+  if (!response.ok) {
+    const reason = data?.error?.message || `HTTP ${response.status}`
+    throw new Error(`YouTube API: ${reason}`)
+  }
+
+  const items = Array.isArray(data.items) ? data.items : []
+
+  return items.map(item => {
+    const videoId = item?.id?.videoId || ''
+    const snippet = item?.snippet || {}
+
+    return {
+      id: videoId,
+      videoId,
+      title: cleanText(snippet.title, 300),
+      artist: cleanText(snippet.channelTitle, 200),
+      channelTitle: cleanText(snippet.channelTitle, 200),
+      thumbnail:
+        snippet?.thumbnails?.high?.url ||
+        snippet?.thumbnails?.medium?.url ||
+        snippet?.thumbnails?.default?.url ||
+        null,
+      youtubeUrl: videoId ? `https://www.youtube.com/watch?v=${videoId}` : null,
+      embedUrl: videoId ? `https://www.youtube.com/embed/${videoId}` : null
+    }
+  }).filter(item => item.id)
+}
+
+async function getMusicLibrary(sql, userId) {
+  const [favorites, history] = await Promise.all([
+    sql`
+      SELECT video_id,title,artist,channel_title,thumbnail,youtube_url,embed_url,added_at
+      FROM music_favorites
+      WHERE username = ${userId}
+      ORDER BY added_at DESC
+      LIMIT 200
+    `,
+    sql`
+      SELECT video_id,title,artist,channel_title,thumbnail,youtube_url,embed_url,played_at
+      FROM music_history
+      WHERE username = ${userId}
+      ORDER BY played_at DESC
+      LIMIT 100
+    `
+  ])
+
+  return {
+    favorites: favorites.map(rowToMusicTrack),
+    history: history.map(rowToMusicTrack)
+  }
+}
+
+async function addMusicHistory(sql, userId, track) {
+  const normalized = normalizeMusicTrack(track)
+  if (!normalized) throw new Error('Data lagu tidak valid')
+
+  await sql`
+    DELETE FROM music_history
+    WHERE username = ${userId} AND video_id = ${normalized.videoId}
+  `
+
+  await sql`
+    INSERT INTO music_history (
+      username,video_id,title,artist,channel_title,thumbnail,youtube_url,embed_url,played_at
+    )
+    VALUES (
+      ${userId},${normalized.videoId},${normalized.title},${normalized.artist},
+      ${normalized.channelTitle},${normalized.thumbnail},${normalized.youtubeUrl},
+      ${normalized.embedUrl},NOW()
+    )
+  `
+
+  // Simpan maksimal 100 history per user.
+  await sql`
+    DELETE FROM music_history
+    WHERE username = ${userId}
+      AND id NOT IN (
+        SELECT id FROM music_history
+        WHERE username = ${userId}
+        ORDER BY played_at DESC
+        LIMIT 100
+      )
+  `
+
+  const rows = await sql`
+    SELECT video_id,title,artist,channel_title,thumbnail,youtube_url,embed_url,played_at
+    FROM music_history
+    WHERE username = ${userId}
+    ORDER BY played_at DESC
+    LIMIT 100
+  `
+
+  return rows.map(rowToMusicTrack)
+}
+
+async function toggleMusicFavorite(sql, userId, track) {
+  const normalized = normalizeMusicTrack(track)
+  if (!normalized) throw new Error('Data lagu tidak valid')
+
+  const existing = await sql`
+    SELECT 1 FROM music_favorites
+    WHERE username = ${userId} AND video_id = ${normalized.videoId}
+    LIMIT 1
+  `
+
+  let favorite
+
+  if (existing.length) {
+    await sql`
+      DELETE FROM music_favorites
+      WHERE username = ${userId} AND video_id = ${normalized.videoId}
+    `
+    favorite = false
+  } else {
+    await sql`
+      INSERT INTO music_favorites (
+        username,video_id,title,artist,channel_title,thumbnail,youtube_url,embed_url,added_at
+      )
+      VALUES (
+        ${userId},${normalized.videoId},${normalized.title},${normalized.artist},
+        ${normalized.channelTitle},${normalized.thumbnail},${normalized.youtubeUrl},
+        ${normalized.embedUrl},NOW()
+      )
+      ON CONFLICT (username,video_id) DO NOTHING
+    `
+    favorite = true
+  }
+
+  const rows = await sql`
+    SELECT video_id,title,artist,channel_title,thumbnail,youtube_url,embed_url,added_at
+    FROM music_favorites
+    WHERE username = ${userId}
+    ORDER BY added_at DESC
+    LIMIT 200
+  `
+
+  return { favorite, favorites: rows.map(rowToMusicTrack) }
+}
+
+function musicJson(data, status = 200) {
+  return json(data, status, apiCorsHeaders())
+}
+
+async function handleMusicSearch(request, env) {
+  const url = new URL(request.url)
+  const query = cleanText(url.searchParams.get('q'), 200)
+
+  if (!query) {
+    return musicJson({ ok: false, error: 'Parameter q wajib diisi' }, 400)
+  }
+
+  try {
+    const results = await youtubeSearchPortal(query, env)
+    return musicJson({ ok: true, query, results })
+  } catch (error) {
+    console.error('[MUSIC_SEARCH_ERROR]', error)
+    return musicJson({ ok: false, error: error.message || 'Gagal mencari musik' }, 500)
+  }
+}
+
+async function handleMusicUser(request, sql, env) {
+  const auth = await getAuthenticatedMusicUser(request, env)
+
+  if (!auth) {
+    return musicJson({ ok: false, error: 'Token tidak valid atau sudah expired' }, 401)
+  }
+
+  try {
+    await ensureMusicTables(sql)
+    const library = await getMusicLibrary(sql, auth.userId)
+
+    return musicJson({ ok: true, userId: auth.userId, ...library })
+  } catch (error) {
+    console.error('[MUSIC_USER_ERROR]', error)
+    return musicJson({ ok: false, error: 'Gagal ambil data musik' }, 500)
+  }
+}
+
+async function handleMusicHistory(request, sql, env) {
+  const auth = await getAuthenticatedMusicUser(request, env)
+
+  if (!auth) {
+    return musicJson({ ok: false, error: 'Token tidak valid' }, 401)
+  }
+
+  try {
+    const body = await readJsonBody(request)
+    await ensureMusicTables(sql)
+    const history = await addMusicHistory(sql, auth.userId, body.track)
+
+    return musicJson({ ok: true, history })
+  } catch (error) {
+    return musicJson({ ok: false, error: error.message || 'Gagal simpan history' }, 400)
+  }
+}
+
+async function handleMusicFavorite(request, sql, env) {
+  const auth = await getAuthenticatedMusicUser(request, env)
+
+  if (!auth) {
+    return musicJson({ ok: false, error: 'Token tidak valid' }, 401)
+  }
+
+  try {
+    const body = await readJsonBody(request)
+    await ensureMusicTables(sql)
+    const result = await toggleMusicFavorite(sql, auth.userId, body.track)
+
+    return musicJson({ ok: true, ...result })
+  } catch (error) {
+    return musicJson({ ok: false, error: error.message || 'Gagal update favorite' }, 400)
+  }
+}
+
+/*
+ * =========================================================
+ * BRIDGE
+ *
+ * Card yang dikirim ke WA (chess & music) dirender di webview
+ * sandboxed yang blokir fetch() langsung ke domain luar. Iframe
+ * kecil tersembunyi ini "menumpang" origin portal buat ngelakuin
+ * fetch, terus balikin hasilnya ke parent lewat postMessage
+ * (postMessage gak kena blokir sandbox yang sama).
+ * =========================================================
+ */
+
+function bridgePage() {
+  return `<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+window.addEventListener('message', async function (event) {
+  var msg = event.data
+
+  if (!msg || typeof msg !== 'object' || !msg.__bridge) return
+
+  var id = msg.id
+  var path = msg.path
+  var opts = msg.opts || {}
+
+  try {
+    var r = await fetch(path, opts)
+    var data = null
+
+    try { data = await r.json() } catch (e) {}
+
+    event.source.postMessage({
+      __bridge: true,
+      id: id,
+      ok: r.ok,
+      status: r.status,
+      data: data
+    }, '*')
+  } catch (err) {
+    event.source.postMessage({
+      __bridge: true,
+      id: id,
+      ok: false,
+      status: 0,
+      error: String((err && err.message) || err)
+    }, '*')
+  }
+})
+</script>
+</body>
+</html>`
+}
+
+async function handleBridge() {
+  return embeddableHtml(bridgePage())
 }
 
 async function createAdminSession(sql, adminId, request) {
@@ -1858,12 +2345,12 @@ async function router(request,env) {
   const method = request.method.toUpperCase()
   const sql = getSql(env)
 
-  if (method === 'OPTIONS' && pathname.startsWith('/api/chess/')) {
+  if (method === 'OPTIONS' && (pathname.startsWith('/api/chess/') || pathname.startsWith('/api/music/'))) {
     return new Response(null, {
       status: 204,
       headers: {
         ...securityHeaders(),
-        ...chessCorsHeaders()
+        ...apiCorsHeaders()
       }
     })
   }
@@ -1945,6 +2432,26 @@ async function router(request,env) {
 
   if (pathname.startsWith('/api/chess/')) {
     return handleChessRoom(request, sql, url, pathname, method)
+  }
+
+  if (pathname === '/apps/bridge') {
+    return handleBridge()
+  }
+
+  if (pathname === '/api/music/search') {
+    return handleMusicSearch(request, env)
+  }
+
+  if (pathname === '/api/music/user') {
+    return handleMusicUser(request, sql, env)
+  }
+
+  if (pathname === '/api/music/user/history') {
+    return handleMusicHistory(request, sql, env)
+  }
+
+  if (pathname === '/api/music/user/favorite') {
+    return handleMusicFavorite(request, sql, env)
   }
 
   return json({
