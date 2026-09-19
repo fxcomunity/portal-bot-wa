@@ -1158,6 +1158,184 @@ async function handleMusicFavorite(request, sql, env) {
 
 /*
  * =========================================================
+ * AI CHAT
+ *
+ * Satu endpoint, tiga provider (OpenAI, Gemini, Grok/xAI).
+ * Dicoba urut sesuai AI_PROVIDER_ORDER; begitu satu provider
+ * error/limit/kosong key-nya, otomatis lanjut ke provider
+ * berikutnya. Auth-nya numpang token HMAC yang sama kayak
+ * music (userId dari bot, gak perlu server tambahan).
+ * =========================================================
+ */
+
+const AI_SYSTEM_PROMPT =
+  'Kamu adalah Qiro AI, asisten WhatsApp yang ramah, santai, dan membantu. ' +
+  'Jawab singkat, jelas, dan pakai Bahasa Indonesia kecuali diminta lain.'
+
+function aiCorsHeaders() {
+  return apiCorsHeaders()
+}
+
+function aiJson(data, status = 200) {
+  return json(data, status, aiCorsHeaders())
+}
+
+function cleanAiMessages(input) {
+  if (!Array.isArray(input)) return []
+
+  return input
+    .filter(msg => msg && typeof msg === 'object')
+    .map(msg => ({
+      role: msg.role === 'assistant' ? 'assistant' : 'user',
+      content: cleanText(msg.content, 4000),
+    }))
+    .filter(msg => msg.content)
+    .slice(-20)
+}
+
+async function callOpenAi(messages, env) {
+  const apiKey = env.OPENAI_API_KEY || ''
+  if (!apiKey) throw new Error('OPENAI_API_KEY kosong')
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || 'gpt-4o-mini',
+      messages: [{ role: 'system', content: AI_SYSTEM_PROMPT }, ...messages],
+      temperature: 0.7,
+    }),
+  })
+
+  const data = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    throw new Error(data?.error?.message || `OpenAI HTTP ${response.status}`)
+  }
+
+  const reply = data?.choices?.[0]?.message?.content
+  if (!reply) throw new Error('OpenAI: respons kosong')
+
+  return reply.trim()
+}
+
+async function callGemini(messages, env) {
+  const apiKey = env.GEMINI_API_KEY || ''
+  if (!apiKey) throw new Error('GEMINI_API_KEY kosong')
+
+  const model = env.GEMINI_MODEL || 'gemini-1.5-flash'
+
+  const contents = messages.map(msg => ({
+    role: msg.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: msg.content }],
+  }))
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents,
+        systemInstruction: { parts: [{ text: AI_SYSTEM_PROMPT }] },
+        generationConfig: { temperature: 0.7 },
+      }),
+    }
+  )
+
+  const data = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    throw new Error(data?.error?.message || `Gemini HTTP ${response.status}`)
+  }
+
+  const reply = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('')
+  if (!reply) throw new Error('Gemini: respons kosong (kemungkinan diblokir safety filter)')
+
+  return reply.trim()
+}
+
+async function callGrok(messages, env) {
+  const apiKey = env.GROK_API_KEY || ''
+  if (!apiKey) throw new Error('GROK_API_KEY kosong')
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: env.GROK_MODEL || 'grok-2-latest',
+      messages: [{ role: 'system', content: AI_SYSTEM_PROMPT }, ...messages],
+      temperature: 0.7,
+    }),
+  })
+
+  const data = await response.json().catch(() => null)
+
+  if (!response.ok) {
+    throw new Error(data?.error?.message || `Grok HTTP ${response.status}`)
+  }
+
+  const reply = data?.choices?.[0]?.message?.content
+  if (!reply) throw new Error('Grok: respons kosong')
+
+  return reply.trim()
+}
+
+const AI_PROVIDERS = [
+  { name: 'openai', call: callOpenAi },
+  { name: 'gemini', call: callGemini },
+  { name: 'grok', call: callGrok },
+]
+
+async function askAi(messages, env) {
+  const errors = []
+
+  for (const provider of AI_PROVIDERS) {
+    try {
+      const reply = await provider.call(messages, env)
+      return { provider: provider.name, reply }
+    } catch (error) {
+      errors.push(`${provider.name}: ${error.message}`)
+    }
+  }
+
+  throw new Error(
+    'Semua provider AI gagal/limit.\n' + errors.join('\n')
+  )
+}
+
+async function handleAiChat(request, env) {
+  const auth = await getAuthenticatedMusicUser(request, env)
+
+  if (!auth) {
+    return aiJson({ ok: false, error: 'Token tidak valid' }, 401)
+  }
+
+  try {
+    const body = await readJsonBody(request)
+    const messages = cleanAiMessages(body.messages)
+
+    if (!messages.length) {
+      return aiJson({ ok: false, error: 'Pesan kosong' }, 400)
+    }
+
+    const result = await askAi(messages, env)
+
+    return aiJson({ ok: true, reply: result.reply, provider: result.provider })
+  } catch (error) {
+    console.error('[AI_CHAT_ERROR]', error)
+    return aiJson({ ok: false, error: error.message || 'Gagal memproses chat AI' }, 500)
+  }
+}
+
+/*
+ * =========================================================
  * BRIDGE
  *
  * Card yang dikirim ke WA (chess & music) dirender di webview
@@ -2345,7 +2523,7 @@ async function router(request,env) {
   const method = request.method.toUpperCase()
   const sql = getSql(env)
 
-  if (method === 'OPTIONS' && (pathname.startsWith('/api/chess/') || pathname.startsWith('/api/music/'))) {
+  if (method === 'OPTIONS' && (pathname.startsWith('/api/chess/') || pathname.startsWith('/api/music/') || pathname.startsWith('/api/ai/'))) {
     return new Response(null, {
       status: 204,
       headers: {
@@ -2452,6 +2630,10 @@ async function router(request,env) {
 
   if (pathname === '/api/music/user/favorite') {
     return handleMusicFavorite(request, sql, env)
+  }
+
+  if (pathname === '/api/ai/chat') {
+    return handleAiChat(request, env)
   }
 
   return json({
